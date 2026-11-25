@@ -1,0 +1,5 @@
+{"event":"pane_exited","pane_id":"terminal_1","tab_id":0,"exit_status":0}
+{"event":"pane_closed","pane_id":"terminal_1","tab_id":0}
+{"event":"tab_focused","tab_id":3}
+{"event":"tab_closed","tab_id":3}
+{"event":"session_ending"}

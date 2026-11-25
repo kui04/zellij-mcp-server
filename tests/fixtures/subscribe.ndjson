@@ -1,0 +1,2 @@
+{"event":"pane_update","is_initial":true,"pane_id":"terminal_1","scrollback":null,"viewport":["probe-line-1",""]}
+{"event":"pane_update","is_initial":false,"pane_id":"terminal_1","scrollback":null,"viewport":["probe-line-1","probe-line-2",""]}

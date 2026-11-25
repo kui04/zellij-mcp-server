@@ -1,0 +1,26 @@
+[
+  {
+    "position": 0,
+    "name": "Tab #1",
+    "active": true,
+    "viewport_rows": 48,
+    "viewport_columns": 210,
+    "display_area_rows": 50,
+    "display_area_columns": 210,
+    "selectable_tiled_panes_count": 1,
+    "selectable_floating_panes_count": 0,
+    "tab_id": 0
+  },
+  {
+    "position": 1,
+    "name": "agent:services",
+    "active": false,
+    "viewport_rows": 48,
+    "viewport_columns": 210,
+    "display_area_rows": 50,
+    "display_area_columns": 210,
+    "selectable_tiled_panes_count": 2,
+    "selectable_floating_panes_count": 0,
+    "tab_id": 3
+  }
+]

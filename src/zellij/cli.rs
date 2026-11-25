@@ -1,0 +1,781 @@
+//! Mockable Zellij CLI execution backend (`M-MOCKABLE-SYSCALLS`).
+
+use std::path::PathBuf;
+use std::process::Output;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail};
+use tokio::process::Command;
+use tracing::debug;
+
+use crate::domain::ids::{CommandSpec, KeyChord, SessionName, TabId, TerminalPaneId};
+use crate::domain::layout::ResolvedPlacement;
+use crate::domain::lifecycle::VisualAction;
+use crate::state::{ObservedPane, ObservedTab};
+use crate::zellij::protocol::{
+    MIN_ZELLIJ_VERSION, parse_current_tab_info_json, parse_list_panes_json, parse_list_tabs_json,
+    parse_new_pane_output, parse_new_tab_output, parse_zellij_version,
+};
+
+/// Parameters for opening a new terminal pane via `zellij action new-pane`.
+#[derive(Debug, Clone)]
+pub struct NewPaneSpec {
+    pub tab_id: Option<TabId>,
+    pub name: String,
+    pub placement: ResolvedPlacement,
+    pub stacked: bool,
+    pub cwd: Option<PathBuf>,
+    pub cmd: CommandSpec,
+    pub env: Vec<(String, String)>,
+}
+
+/// Dispatches Zellij CLI operations either to a real `zellij` binary or to an in-memory mock.
+#[derive(Debug, Clone)]
+pub struct ZellijClient {
+    backend: ZellijBackend,
+}
+
+#[derive(Debug, Clone)]
+enum ZellijBackend {
+    Process {
+        binary: PathBuf,
+        session: SessionName,
+    },
+    #[cfg(feature = "test-util")]
+    Mock(mock::MockZellijCtrl),
+}
+
+impl ZellijClient {
+    /// Creates a production client backed by the given `zellij` executable and target session.
+    pub fn new(binary: PathBuf, session: SessionName) -> Self {
+        Self {
+            backend: ZellijBackend::Process { binary, session },
+        }
+    }
+
+    /// Creates a mocked client paired with its test controller (`M-MOCKABLE-SYSCALLS`).
+    #[cfg(feature = "test-util")]
+    pub fn new_mocked(session: SessionName) -> (Self, mock::MockZellijCtrl) {
+        let ctrl = mock::MockZellijCtrl::new(session);
+        let client = Self {
+            backend: ZellijBackend::Mock(ctrl.clone()),
+        };
+        (client, ctrl)
+    }
+
+    pub fn session(&self) -> &SessionName {
+        match &self.backend {
+            ZellijBackend::Process { session, .. } => session,
+            #[cfg(feature = "test-util")]
+            ZellijBackend::Mock(ctrl) => ctrl.session(),
+        }
+    }
+
+    pub fn binary_path(&self) -> Option<&PathBuf> {
+        match &self.backend {
+            ZellijBackend::Process { binary, .. } => Some(binary),
+            #[cfg(feature = "test-util")]
+            ZellijBackend::Mock(_) => None,
+        }
+    }
+
+    async fn run_raw(&self, args: &[String]) -> Result<Output> {
+        let binary = match &self.backend {
+            ZellijBackend::Process { binary, .. } => binary,
+            #[cfg(feature = "test-util")]
+            ZellijBackend::Mock(_) => bail!("run_raw called on mock backend"),
+        };
+        debug!(binary = %binary.display(), ?args, "executing zellij cli");
+        Command::new(binary)
+            .args(args)
+            .output()
+            .await
+            .with_context(|| format!("failed to spawn {} {:?}", binary.display(), args))
+    }
+
+    async fn run_session(&self, sub_args: &[String]) -> Result<Output> {
+        let mut args = Vec::with_capacity(2 + sub_args.len());
+        args.push("--session".to_owned());
+        args.push(self.session().as_str().to_owned());
+        args.extend(sub_args.iter().cloned());
+        self.run_raw(&args).await
+    }
+
+    async fn run_session_checked(&self, sub_args: &[String]) -> Result<String> {
+        let output = self.run_session(sub_args).await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            bail!(
+                "zellij {:?} exited with {}: stderr={}, stdout={}",
+                sub_args,
+                output.status,
+                stderr.trim(),
+                stdout.trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Verifies that the configured Zellij binary meets `MIN_ZELLIJ_VERSION`.
+    pub async fn check_version(&self) -> Result<(u32, u32, u32)> {
+        match &self.backend {
+            ZellijBackend::Process { .. } => {
+                let output = self.run_raw(&["--version".to_owned()]).await?;
+                if !output.status.success() {
+                    bail!(
+                        "zellij --version failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let version = parse_zellij_version(&stdout)?;
+                if version < MIN_ZELLIJ_VERSION {
+                    bail!(
+                        "zellij {}.{}.{} is too old; >= {}.{}.{} is required for `zellij events`",
+                        version.0,
+                        version.1,
+                        version.2,
+                        MIN_ZELLIJ_VERSION.0,
+                        MIN_ZELLIJ_VERSION.1,
+                        MIN_ZELLIJ_VERSION.2
+                    );
+                }
+                Ok(version)
+            }
+            #[cfg(feature = "test-util")]
+            ZellijBackend::Mock(ctrl) => {
+                ctrl.record("check_version");
+                Ok(MIN_ZELLIJ_VERSION)
+            }
+        }
+    }
+
+    /// Ensures the target session exists via `zellij attach --create-background <session>`.
+    pub async fn ensure_session(&self) -> Result<()> {
+        match &self.backend {
+            ZellijBackend::Process { session, .. } => {
+                let args = vec![
+                    "attach".to_owned(),
+                    "--create-background".to_owned(),
+                    session.as_str().to_owned(),
+                ];
+                let output = self.run_raw(&args).await?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    bail!(
+                        "zellij attach --create-background {} failed ({}): {}",
+                        session,
+                        output.status,
+                        stderr.trim()
+                    );
+                }
+                // `attach --create-background` returns before the new session finishes initializing
+                // its initial tab; wait briefly until `list-tabs --all --json` responds cleanly.
+                for _ in 0..25 {
+                    if let Ok(tabs) = self.list_tabs().await
+                        && !tabs.is_empty()
+                    {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Ok(())
+            }
+            #[cfg(feature = "test-util")]
+            ZellijBackend::Mock(ctrl) => {
+                ctrl.record("ensure_session");
+                Ok(())
+            }
+        }
+    }
+
+    /// Lazily creates a new tab without stealing focus (`--no-focus`).
+    pub async fn new_tab(&self, name: &str) -> Result<TabId> {
+        match &self.backend {
+            ZellijBackend::Process { .. } => {
+                let args = vec![
+                    "action".to_owned(),
+                    "new-tab".to_owned(),
+                    "--name".to_owned(),
+                    name.to_owned(),
+                    "--no-focus".to_owned(),
+                ];
+                let stdout = self.run_session_checked(&args).await?;
+                parse_new_tab_output(&stdout)
+            }
+            #[cfg(feature = "test-util")]
+            ZellijBackend::Mock(ctrl) => Ok(ctrl.mock_new_tab(name)),
+        }
+    }
+
+    /// Opens a new terminal pane without stealing focus (`--no-focus`).
+    pub async fn new_pane(&self, spec: &NewPaneSpec) -> Result<TerminalPaneId> {
+        match &self.backend {
+            ZellijBackend::Process { .. } => {
+                let mut args = vec![
+                    "action".to_owned(),
+                    "new-pane".to_owned(),
+                    "--no-focus".to_owned(),
+                    "--name".to_owned(),
+                    spec.name.clone(),
+                ];
+                if let Some(tab_id) = spec.tab_id {
+                    args.push("--tab-id".to_owned());
+                    args.push(tab_id.to_string());
+                }
+                if let Some(cwd) = &spec.cwd {
+                    args.push("--cwd".to_owned());
+                    args.push(cwd.to_string_lossy().into_owned());
+                }
+                match spec.placement {
+                    ResolvedPlacement::SplitRight => {
+                        args.push("--direction".to_owned());
+                        args.push("right".to_owned());
+                    }
+                    ResolvedPlacement::SplitDown => {
+                        args.push("--direction".to_owned());
+                        args.push("down".to_owned());
+                    }
+                    ResolvedPlacement::Floating => {
+                        args.push("--floating".to_owned());
+                        args.push("--x".to_owned());
+                        args.push("12%".to_owned());
+                        args.push("--y".to_owned());
+                        args.push("12%".to_owned());
+                        args.push("--width".to_owned());
+                        args.push("75%".to_owned());
+                        args.push("--height".to_owned());
+                        args.push("75%".to_owned());
+                    }
+                    ResolvedPlacement::Stacked => {
+                        args.push("--stacked".to_owned());
+                    }
+                    ResolvedPlacement::BackgroundTab => {
+                        if spec.stacked {
+                            args.push("--stacked".to_owned());
+                        }
+                    }
+                }
+                args.push("--".to_owned());
+                args.extend(spec.cmd.to_zellij_argv(&spec.env));
+
+                let stdout = self.run_session_checked(&args).await?;
+                parse_new_pane_output(&stdout)
+            }
+            #[cfg(feature = "test-util")]
+            ZellijBackend::Mock(ctrl) => Ok(ctrl.mock_new_pane(spec)),
+        }
+    }
+
+    /// Switches a tab to the `stacked` swap layout; treats exit code 1 as non-fatal.
+    pub async fn apply_stacked_layout(&self, tab_id: TabId) -> Result<bool> {
+        match &self.backend {
+            ZellijBackend::Process { .. } => {
+                let args = vec![
+                    "action".to_owned(),
+                    "apply-tiled-swap-layout".to_owned(),
+                    "stacked".to_owned(),
+                    "--tab-id".to_owned(),
+                    tab_id.to_string(),
+                ];
+                let output = self.run_session(&args).await?;
+                match output.status.code() {
+                    Some(0) => Ok(true),
+                    Some(1) => {
+                        debug!(%tab_id, "stacked swap layout not available for current pane count");
+                        Ok(false)
+                    }
+                    _ => bail!(
+                        "apply-tiled-swap-layout failed ({}): {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                }
+            }
+            #[cfg(feature = "test-util")]
+            ZellijBackend::Mock(ctrl) => {
+                ctrl.record(&format!("apply_stacked_layout:{tab_id}"));
+                Ok(true)
+            }
+        }
+    }
+
+    /// Injects text into a pane via bracketed paste (`zellij action paste`).
+    pub async fn paste(&self, pane_id: TerminalPaneId, text: &str) -> Result<()> {
+        match &self.backend {
+            ZellijBackend::Process { .. } => {
+                let args = vec![
+                    "action".to_owned(),
+                    "paste".to_owned(),
+                    "--pane-id".to_owned(),
+                    pane_id.cli_arg(),
+                    "--".to_owned(),
+                    text.to_owned(),
+                ];
+                let _ = self.run_session_checked(&args).await?;
+                Ok(())
+            }
+            #[cfg(feature = "test-util")]
+            ZellijBackend::Mock(ctrl) => {
+                ctrl.record(&format!("paste:{pane_id}:{text}"));
+                Ok(())
+            }
+        }
+    }
+
+    /// Sends one or more key chords (`zellij action send-keys`).
+    pub async fn send_keys(&self, pane_id: TerminalPaneId, keys: &[KeyChord]) -> Result<()> {
+        match &self.backend {
+            ZellijBackend::Process { .. } => {
+                let mut args = vec![
+                    "action".to_owned(),
+                    "send-keys".to_owned(),
+                    "--pane-id".to_owned(),
+                    pane_id.cli_arg(),
+                    "--".to_owned(),
+                ];
+                args.extend(keys.iter().map(|k| k.as_str().to_owned()));
+                let _ = self.run_session_checked(&args).await?;
+                Ok(())
+            }
+            #[cfg(feature = "test-util")]
+            ZellijBackend::Mock(ctrl) => {
+                let joined = keys
+                    .iter()
+                    .map(KeyChord::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                ctrl.record(&format!("send_keys:{pane_id}:{joined}"));
+                Ok(())
+            }
+        }
+    }
+
+    /// Dumps only the visible viewport of a pane (`zellij action dump-screen --pane-id <id>`).
+    pub async fn dump_viewport(&self, pane_id: TerminalPaneId) -> Result<String> {
+        match &self.backend {
+            ZellijBackend::Process { .. } => {
+                let args = vec![
+                    "action".to_owned(),
+                    "dump-screen".to_owned(),
+                    "--pane-id".to_owned(),
+                    pane_id.cli_arg(),
+                ];
+                self.run_session_checked(&args).await
+            }
+            #[cfg(feature = "test-util")]
+            ZellijBackend::Mock(ctrl) => Ok(ctrl.mock_dump_screen(pane_id)),
+        }
+    }
+
+    /// Dumps full scrollback of a pane (`zellij action dump-screen --full --pane-id <id>`).
+    pub async fn dump_screen(
+        &self,
+        pane_id: TerminalPaneId,
+        preserve_ansi: bool,
+    ) -> Result<String> {
+        match &self.backend {
+            ZellijBackend::Process { .. } => {
+                let mut args = vec![
+                    "action".to_owned(),
+                    "dump-screen".to_owned(),
+                    "--full".to_owned(),
+                    "--pane-id".to_owned(),
+                    pane_id.cli_arg(),
+                ];
+                if preserve_ansi {
+                    args.push("--ansi".to_owned());
+                }
+                self.run_session_checked(&args).await
+            }
+            #[cfg(feature = "test-util")]
+            ZellijBackend::Mock(ctrl) => Ok(ctrl.mock_dump_screen(pane_id)),
+        }
+    }
+
+    pub async fn list_tabs(&self) -> Result<Vec<ObservedTab>> {
+        match &self.backend {
+            ZellijBackend::Process { .. } => {
+                let stdout = self
+                    .run_session_checked(&[
+                        "action".to_owned(),
+                        "list-tabs".to_owned(),
+                        "--all".to_owned(),
+                        "--json".to_owned(),
+                    ])
+                    .await?;
+                parse_list_tabs_json(&stdout)
+            }
+            #[cfg(feature = "test-util")]
+            ZellijBackend::Mock(ctrl) => Ok(ctrl.mock_list_tabs()),
+        }
+    }
+
+    /// Queries the currently active tab. Returns `Ok(None)` in headless background sessions where
+    /// no client is attached (Zellij exits with code 2).
+    pub async fn current_tab_info(&self) -> Result<Option<ObservedTab>> {
+        match &self.backend {
+            ZellijBackend::Process { .. } => {
+                let output = self
+                    .run_session(&[
+                        "action".to_owned(),
+                        "current-tab-info".to_owned(),
+                        "--json".to_owned(),
+                    ])
+                    .await?;
+                match output.status.code() {
+                    Some(0) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        Ok(Some(parse_current_tab_info_json(&stdout)?))
+                    }
+                    Some(2) => Ok(None),
+                    _ => Err(anyhow!(
+                        "current-tab-info failed ({}): {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    )),
+                }
+            }
+            #[cfg(feature = "test-util")]
+            ZellijBackend::Mock(ctrl) => Ok(ctrl.mock_current_tab_info()),
+        }
+    }
+
+    pub async fn list_panes(&self) -> Result<Vec<ObservedPane>> {
+        match &self.backend {
+            ZellijBackend::Process { .. } => {
+                let stdout = self
+                    .run_session_checked(&[
+                        "action".to_owned(),
+                        "list-panes".to_owned(),
+                        "--all".to_owned(),
+                        "--json".to_owned(),
+                    ])
+                    .await?;
+                parse_list_panes_json(&stdout)
+            }
+            #[cfg(feature = "test-util")]
+            ZellijBackend::Mock(ctrl) => Ok(ctrl.mock_list_panes()),
+        }
+    }
+
+    /// Executes a single visual feedback side effect derived from a state transition.
+    pub async fn apply_visual_action(&self, action: &VisualAction) -> Result<()> {
+        match &self.backend {
+            ZellijBackend::Process { .. } => match action {
+                VisualAction::RenamePane { pane_id, title } => {
+                    let _ = self
+                        .run_session_checked(&[
+                            "action".to_owned(),
+                            "rename-pane".to_owned(),
+                            "--pane-id".to_owned(),
+                            pane_id.cli_arg(),
+                            "--".to_owned(),
+                            title.clone(),
+                        ])
+                        .await?;
+                    Ok(())
+                }
+                VisualAction::HighlightError {
+                    pane_id,
+                    bg_hex,
+                    border_style,
+                } => {
+                    let _ = self
+                        .run_session_checked(&[
+                            "action".to_owned(),
+                            "set-pane-color".to_owned(),
+                            "--pane-id".to_owned(),
+                            pane_id.cli_arg(),
+                            "--bg".to_owned(),
+                            (*bg_hex).to_owned(),
+                        ])
+                        .await?;
+                    let _ = self
+                        .run_session_checked(&[
+                            "action".to_owned(),
+                            "set-pane-border-style".to_owned(),
+                            "--pane-id".to_owned(),
+                            pane_id.cli_arg(),
+                            "--border-style".to_owned(),
+                            (*border_style).to_owned(),
+                        ])
+                        .await?;
+                    Ok(())
+                }
+                VisualAction::ResetPaneColor { pane_id } => {
+                    let _ = self
+                        .run_session_checked(&[
+                            "action".to_owned(),
+                            "set-pane-color".to_owned(),
+                            "--pane-id".to_owned(),
+                            pane_id.cli_arg(),
+                            "--reset".to_owned(),
+                        ])
+                        .await?;
+                    Ok(())
+                }
+                VisualAction::MarkAttention { pane_id } => {
+                    let _ = self
+                        .run_session_checked(&[
+                            "action".to_owned(),
+                            "watch-pane".to_owned(),
+                            "--pane-id".to_owned(),
+                            pane_id.cli_arg(),
+                        ])
+                        .await?;
+                    Ok(())
+                }
+                VisualAction::ShowFloatingPanes { tab_id } => {
+                    let output = self
+                        .run_session(&[
+                            "action".to_owned(),
+                            "show-floating-panes".to_owned(),
+                            "--tab-id".to_owned(),
+                            tab_id.to_string(),
+                        ])
+                        .await?;
+                    match output.status.code() {
+                        Some(0 | 2) => Ok(()),
+                        _ => bail!(
+                            "show-floating-panes failed ({}): {}",
+                            output.status,
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        ),
+                    }
+                }
+                VisualAction::Notify { message } => {
+                    let _ = self
+                        .run_session(&[
+                            "prompt".to_owned(),
+                            "--timeout".to_owned(),
+                            "5s".to_owned(),
+                            "notify".to_owned(),
+                            message.clone(),
+                        ])
+                        .await?;
+                    Ok(())
+                }
+                VisualAction::ClosePane { pane_id } => {
+                    let _ = self
+                        .run_session_checked(&[
+                            "action".to_owned(),
+                            "close-pane".to_owned(),
+                            "--pane-id".to_owned(),
+                            pane_id.cli_arg(),
+                        ])
+                        .await?;
+                    Ok(())
+                }
+            },
+            #[cfg(feature = "test-util")]
+            ZellijBackend::Mock(ctrl) => {
+                ctrl.record(&format!("visual:{action:?}"));
+                Ok(())
+            }
+        }
+    }
+
+    /// Prompts the human at the terminal to confirm a destructive action (`zellij prompt confirm`).
+    pub async fn confirm_destructive(&self, message: &str, timeout: Duration) -> Result<bool> {
+        match &self.backend {
+            ZellijBackend::Process { .. } => {
+                let secs = timeout.as_secs().max(1);
+                let output = self
+                    .run_session(&[
+                        "prompt".to_owned(),
+                        "--timeout".to_owned(),
+                        format!("{secs}s"),
+                        "confirm".to_owned(),
+                        message.to_owned(),
+                    ])
+                    .await?;
+                match output.status.code() {
+                    Some(0) => Ok(true),
+                    Some(1 | 124) => Ok(false),
+                    _ => bail!(
+                        "zellij prompt confirm failed ({}): {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                }
+            }
+            #[cfg(feature = "test-util")]
+            ZellijBackend::Mock(ctrl) => {
+                ctrl.record(&format!("confirm:{message}"));
+                Ok(ctrl.confirm_answer())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-util")]
+pub mod mock {
+    //! In-memory mock controller for deterministic orchestration tests.
+
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use crate::domain::ids::{SessionName, TabId, TerminalPaneId};
+    use crate::domain::layout::{ResolvedPlacement, ViewportSnapshot};
+    use crate::state::{ObservedPane, ObservedTab};
+    use crate::zellij::cli::NewPaneSpec;
+
+    /// Cloneable handle to inspect recorded calls and script mock responses.
+    #[derive(Debug, Clone)]
+    pub struct MockZellijCtrl {
+        inner: Arc<MockZellijInner>,
+    }
+
+    #[derive(Debug)]
+    struct MockZellijInner {
+        session: SessionName,
+        state: Mutex<MockState>,
+    }
+
+    #[derive(Debug)]
+    struct MockState {
+        next_tab_id: u32,
+        next_pane_id: u32,
+        tabs: Vec<ObservedTab>,
+        panes: Vec<ObservedPane>,
+        screen_dumps: HashMap<TerminalPaneId, String>,
+        confirm_answer: bool,
+        recorded_actions: Vec<String>,
+    }
+
+    impl MockZellijCtrl {
+        pub fn new(session: SessionName) -> Self {
+            let initial_tab = ObservedTab {
+                tab_id: TabId::new(0),
+                name: "Tab #1".to_owned(),
+                active: true,
+                viewport: ViewportSnapshot::new(200, 50, 1),
+            };
+            Self {
+                inner: Arc::new(MockZellijInner {
+                    session,
+                    state: Mutex::new(MockState {
+                        next_tab_id: 1,
+                        next_pane_id: 1,
+                        tabs: vec![initial_tab],
+                        panes: Vec::new(),
+                        screen_dumps: HashMap::new(),
+                        confirm_answer: true,
+                        recorded_actions: Vec::new(),
+                    }),
+                }),
+            }
+        }
+
+        pub fn session(&self) -> &SessionName {
+            &self.inner.session
+        }
+
+        fn lock_state(&self) -> std::sync::MutexGuard<'_, MockState> {
+            match self.inner.state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            }
+        }
+
+        pub fn record(&self, action: &str) {
+            self.lock_state().recorded_actions.push(action.to_owned());
+        }
+
+        pub fn recorded_actions(&self) -> Vec<String> {
+            self.lock_state().recorded_actions.clone()
+        }
+
+        pub fn set_viewport(&self, columns: u16, rows: u16, tiled_panes: u16) {
+            let mut state = self.lock_state();
+            if let Some(tab) = state.tabs.first_mut() {
+                tab.viewport = ViewportSnapshot::new(columns, rows, tiled_panes);
+            }
+        }
+
+        pub fn set_screen_dump(&self, pane_id: TerminalPaneId, content: impl Into<String>) {
+            let _ = self
+                .lock_state()
+                .screen_dumps
+                .insert(pane_id, content.into());
+        }
+
+        pub fn set_confirm_answer(&self, answer: bool) {
+            self.lock_state().confirm_answer = answer;
+        }
+
+        pub fn confirm_answer(&self) -> bool {
+            self.lock_state().confirm_answer
+        }
+
+        pub fn seed_pane(&self, pane: ObservedPane) {
+            self.lock_state().panes.push(pane);
+        }
+
+        pub(crate) fn mock_new_tab(&self, name: &str) -> TabId {
+            let mut state = self.lock_state();
+            let tab_id = TabId::new(state.next_tab_id);
+            state.next_tab_id += 1;
+            let viewport = state
+                .tabs
+                .first()
+                .map_or(ViewportSnapshot::new(200, 50, 0), |t| t.viewport);
+            state.tabs.push(ObservedTab {
+                tab_id,
+                name: name.to_owned(),
+                active: false,
+                viewport,
+            });
+            state.recorded_actions.push(format!("new_tab:{name}"));
+            tab_id
+        }
+
+        pub(crate) fn mock_new_pane(&self, spec: &NewPaneSpec) -> TerminalPaneId {
+            let mut state = self.lock_state();
+            let pane_id = TerminalPaneId::new(state.next_pane_id);
+            state.next_pane_id += 1;
+            let tab_id = spec.tab_id.unwrap_or(TabId::new(0));
+            state.panes.push(ObservedPane {
+                pane_id,
+                tab_id,
+                title: spec.name.clone(),
+                is_floating: spec.placement == ResolvedPlacement::Floating,
+                exited: false,
+                exit_status: None,
+                cwd: spec.cwd.clone(),
+                command: Some(spec.cmd.program().to_owned()),
+            });
+            state
+                .recorded_actions
+                .push(format!("new_pane:{pane_id}:{}:tab={tab_id}", spec.name));
+            pane_id
+        }
+
+        pub(crate) fn mock_dump_screen(&self, pane_id: TerminalPaneId) -> String {
+            let mut state = self.lock_state();
+            state
+                .recorded_actions
+                .push(format!("dump_screen:{pane_id}"));
+            state
+                .screen_dumps
+                .get(&pane_id)
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        pub(crate) fn mock_list_tabs(&self) -> Vec<ObservedTab> {
+            self.lock_state().tabs.clone()
+        }
+
+        pub(crate) fn mock_current_tab_info(&self) -> Option<ObservedTab> {
+            let state = self.lock_state();
+            state.tabs.iter().find(|t| t.active).cloned()
+        }
+
+        pub(crate) fn mock_list_panes(&self) -> Vec<ObservedPane> {
+            self.lock_state().panes.clone()
+        }
+    }
+}

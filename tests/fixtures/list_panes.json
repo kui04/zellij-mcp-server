@@ -1,0 +1,37 @@
+[
+  {
+    "id": 0,
+    "is_plugin": true,
+    "is_floating": false,
+    "title": "tab-bar",
+    "exited": false,
+    "exit_status": null,
+    "terminal_command": null,
+    "tab_id": 0,
+    "tab_name": "Tab #1"
+  },
+  {
+    "id": 0,
+    "is_plugin": false,
+    "is_floating": false,
+    "title": "Pane #1",
+    "exited": false,
+    "exit_status": null,
+    "terminal_command": null,
+    "pane_command": "/bin/bash",
+    "pane_cwd": "/home/kui04/Workspace/dev/zellij-mcp-server",
+    "tab_id": 0,
+    "tab_name": "Tab #1"
+  },
+  {
+    "id": 1,
+    "is_plugin": false,
+    "is_floating": false,
+    "title": "[RUN] mcp:task:t_01:probe",
+    "exited": true,
+    "exit_status": 0,
+    "terminal_command": "sh -c echo probe-line-1; sleep 0.4; exit 0",
+    "tab_id": 0,
+    "tab_name": "Tab #1"
+  }
+]
