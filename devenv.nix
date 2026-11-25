@@ -12,6 +12,37 @@ let
     # and clippy stay on the locked stable toolchain.
     nightlyRustfmt = rustOverlayPkgs.rust-bin.nightly.latest.rustfmt;
     rustToolchain = config.languages.rust.toolchainPackage;
+
+    # nixpkgs still ships zellij 0.46.0, which has no `zellij events` command.
+    # The MCP event bus needs 0.46.1 or newer. Use the official static build for
+    # x86_64-linux until nixpkgs catches up.
+    zellij = pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
+        pname = "zellij";
+        version = "0.46.1";
+
+        src = pkgs.fetchurl {
+            url = "https://github.com/zellij-org/zellij/releases/download/v${finalAttrs.version}/zellij-x86_64-unknown-linux-musl.tar.gz";
+            hash = "sha256-FjMhE1fCNgU7UdGuZBXCP3/3Gqro4IcxXkmc7KGxf6Q=";
+        };
+
+        sourceRoot = ".";
+        dontConfigure = true;
+        dontBuild = true;
+        dontFixup = true;
+
+        installPhase = ''
+            install -Dm755 zellij $out/bin/zellij
+        '';
+
+        meta = {
+            description = "Terminal workspace with panes, tabs and layouts";
+            homepage = "https://zellij.dev";
+            license = pkgs.lib.licenses.mit;
+            mainProgram = "zellij";
+            platforms = [ "x86_64-linux" ];
+            sourceProvenance = [ pkgs.lib.sourceTypes.binaryNativeCode ];
+        };
+    });
 in
 {
     languages.rust = {
@@ -36,7 +67,7 @@ in
         pkgs.git
         pkgs.nixfmt
         # The server drives a real zellij process, so integration tests need it.
-        pkgs.zellij
+        zellij
     ];
 
     scripts = {
