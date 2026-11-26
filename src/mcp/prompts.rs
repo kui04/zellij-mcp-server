@@ -3,33 +3,21 @@
 use crate::domain::ids::{ReplName, ServiceName, TaskId};
 
 /// Layer 1 global routing instructions returned in MCP `InitializeResult.instructions`.
+///
+/// Line 1 is a self-contained summary because clients such as Pi (`codemode`/`deferred`) inject
+/// only the first line into the system prompt; the body stays compact to avoid truncation in
+/// clients with shared prompt budgets.
 pub const SERVER_INSTRUCTIONS: &str = "\
-You have access to a Zellij-backed execution workspace visible to the human user in real time.
-NEVER run long builds, dev servers, or interactive tools via shell `nohup`, `&`, `timeout`, or `sleep` polling loops.
+Human-visible Zellij workspace (no `nohup`/`&`/`sleep` polling): `task_run`+`task_wait` for builds/tests, `service_start` for servers/watchers, `repl_open`+`repl_exec` for REPL/SSH, `workspace_status` to inspect; read full instructions for rules.
 
-Route every execution request to the matching abstraction:
-1. Finite commands with an exit code (build, test, lint, migrations) -> `task_run`.
-   - Fast commands (<=3s) return output immediately.
-   - Long commands return `task_id` with status=\"running\". Do other useful work or call `task_wait(task_ids)` to block server-side until completion. NEVER poll `task_logs` in a loop.
-2. Long-lived background processes (dev servers like `pnpm dev`, proxies, watchers) -> `service_start`.
-   - Always pass a stable `name` (e.g. \"web-dev\") and a `ready_pattern` (e.g. \"Local: http://\") when known.
-   - Read incremental logs via `service_logs(name, since_seq=...)`.
-3. Stateful interactive sessions (`ssh`, `gdb`, `python3`, `psql`) -> `repl_open` + `repl_exec`.
-   - Always pass `prompt_pattern` when known (e.g. \"(gdb) \", \">>> \"). Patterns match only at the end of a waiting prompt line, never echoed command lines.
-   - If the pane appears blocked on a password, 2FA, or interactive confirmation, STOP and tell the user which Zellij pane name to take over.
+Routing rules:
+- Finite commands (`task_run`): fast commands (<=3s) return output immediately; otherwise do parallel work or block server-side with `task_wait(task_ids)`. Never poll `task_logs` in a loop.
+- Background processes (`service_start`): pass a stable `name` and `ready_pattern` when known; read incremental logs with `service_logs(name, since_seq=...)`.
+- Interactive sessions (`repl_open` + `repl_exec`): pass `prompt_pattern` when known (matches only end of a waiting prompt line, never echoed input). If blocked on password, 2FA, or confirmation, STOP and ask the user to take over that Zellij pane name.
 
-Layout & placement rules (layout is managed dynamically by the MCP server; never specify raw x/y/width coordinates):
-- Default to `placement=\"auto\"` unless context strongly favors a specific layout.
-- The server enforces hard minimum pane dimensions (`--min-pane-cols` / `--min-pane-rows`) before splitting the focused pane and automatically downgrades to `background_tab` (tasks/services) or `floating` (REPLs) when a split would squeeze the focused pane below those bounds. Check the returned `placement`, `tab_id`, `tab_name`, and `hint` fields.
-- Check `workspace_status.viewport` before overriding placement:
-  - Narrow (<160 cols): prefer `floating` for REPLs and `background_tab` for tasks/services.
-  - Wide (160-219 cols): prefer `split_right` in the current tab for active REPLs or focal builds when `tiled_panes_in_current_tab <= 1`; otherwise `stacked` or `floating`. Keep long-lived services in `background_tab`.
-  - Ultrawide (>=220 cols): you may keep tasks, REPLs, and a stacked service column inside the default tab for single-screen visibility.
-  - Headless sessions (0 attached clients): `background_tab` and `stacked` automatically fall back to `floating` until a terminal client attaches.
-
-Human observability rule:
-- Keep failed task panes open (`close_pane=false`) so the user can inspect the colored terminal output directly.
-- Call `workspace_status` first if resuming a conversation or unsure what services are already running.";
+Layout & observability:
+- Default to `placement=\"auto\"` (never raw x/y/width). The server enforces min pane bounds, downgrading crowded splits or headless tabs/stacks automatically; inspect `workspace_status.viewport` before overriding.
+- Keep failed task panes open (`close_pane=false`) so the human can inspect terminal output, and call `workspace_status` first when resuming or checking active services.";
 
 /// Layer 3 dynamic hint when a task exceeds the synchronous fast-path wait window.
 pub fn hint_task_running(task_id: &TaskId) -> String {
@@ -57,4 +45,38 @@ pub fn hint_repl_input_required(name: &ReplName, pane_title: &str) -> String {
     format!(
         "REPL '{name}' appears blocked waiting for human input (password, 2FA, or confirmation). Stop and ask the user to take over Zellij pane '{pane_title}'."
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SERVER_INSTRUCTIONS;
+
+    #[test]
+    fn server_instructions_first_line_is_self_contained_summary_and_body_is_compact() {
+        let first_line = SERVER_INSTRUCTIONS.lines().next().unwrap_or("");
+        assert!(!first_line.is_empty());
+        assert!(
+            first_line.len() <= 280,
+            "first line too long ({} bytes): {first_line}",
+            first_line.len()
+        );
+        for required in [
+            "task_run",
+            "task_wait",
+            "service_start",
+            "repl_open",
+            "repl_exec",
+            "workspace_status",
+        ] {
+            assert!(
+                first_line.contains(required),
+                "first line must mention '{required}' for single-line MCP clients"
+            );
+        }
+        assert!(
+            SERVER_INSTRUCTIONS.len() <= 1500,
+            "full instructions too long ({} bytes)",
+            SERVER_INSTRUCTIONS.len()
+        );
+    }
 }
