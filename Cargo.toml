@@ -2,7 +2,16 @@
 name = "zellij-mcp-server"
 version = "0.1.0"
 edition = "2024"
+description = "Asynchronous Zellij-backed terminal orchestration MCP server over stdio"
+repository = "https://github.com/kui04/zellij-mcp-server"
 publish = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
 
 [features]
 default = []

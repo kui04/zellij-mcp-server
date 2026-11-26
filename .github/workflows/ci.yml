@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Format and Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install nightly rustfmt
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo +nightly fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            zellij_target: x86_64-unknown-linux-musl
+            run_e2e: true
+          - os: ubuntu-24.04-arm
+            zellij_target: aarch64-unknown-linux-musl
+            run_e2e: true
+          - os: macos-latest
+            run_e2e: false
+          - os: windows-latest
+            run_e2e: false
+          - os: windows-11-arm
+            run_e2e: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      - name: Install Zellij 0.46.1 for E2E tests
+        if: matrix.run_e2e
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="zellij-${{ matrix.zellij_target }}.tar.gz"
+          base_url="https://github.com/zellij-org/zellij/releases/download/v0.46.1"
+          curl -fsSL "$base_url/$archive" -o "$RUNNER_TEMP/$archive"
+          curl -fsSL "$base_url/zellij-${{ matrix.zellij_target }}.sha256sum" -o "$RUNNER_TEMP/zellij.sha256sum"
+          (cd "$RUNNER_TEMP" && sha256sum -c zellij.sha256sum)
+          mkdir -p "$RUNNER_TEMP/zellij-bin"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/zellij-bin"
+          echo "$RUNNER_TEMP/zellij-bin" >> "$GITHUB_PATH"
+
+      - name: Run full test suite (including real Zellij E2E)
+        if: matrix.run_e2e
+        run: cargo test --all-features
+
+      - name: Run deterministic unit and orchestrator tests
+        if: "!matrix.run_e2e"
+        run: cargo test --all-features --test core_tests --test orchestrator_tests
