@@ -39,6 +39,7 @@ pub fn is_active_session_in_list(stdout: &str, session: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscribeFrame {
     pub pane_id: TerminalPaneId,
+    pub is_initial: bool,
     pub viewport_lines: Vec<String>,
 }
 
@@ -138,6 +139,8 @@ struct RawPaneInfo {
     #[serde(default)]
     is_plugin: bool,
     #[serde(default)]
+    is_focused: bool,
+    #[serde(default)]
     is_floating: bool,
     #[serde(default)]
     title: String,
@@ -147,6 +150,10 @@ struct RawPaneInfo {
     exit_status: Option<i32>,
     #[serde(default)]
     tab_id: u32,
+    #[serde(default)]
+    pane_columns: u16,
+    #[serde(default)]
+    pane_rows: u16,
     #[serde(default)]
     pane_cwd: Option<String>,
     #[serde(default)]
@@ -166,7 +173,10 @@ pub fn parse_list_panes_json(json: &str) -> Result<Vec<ObservedPane>> {
             pane_id: TerminalPaneId::new(p.id),
             tab_id: TabId::new(p.tab_id),
             title: p.title,
+            is_focused: p.is_focused,
             is_floating: p.is_floating,
+            columns: p.pane_columns,
+            rows: p.pane_rows,
             exited: p.exited,
             exit_status: p.exit_status,
             cwd: p.pane_cwd.map(PathBuf::from),
@@ -235,6 +245,8 @@ pub fn parse_event_line(line: &str) -> Result<Option<ZellijEvent>> {
 struct RawSubscribeFrame {
     event: String,
     #[serde(default)]
+    is_initial: bool,
+    #[serde(default)]
     pane_id: Option<String>,
     #[serde(default)]
     scrollback: Option<Vec<String>>,
@@ -263,6 +275,7 @@ pub fn parse_subscribe_line(line: &str) -> Result<Option<SubscribeFrame>> {
     viewport_lines.extend(raw.viewport);
     Ok(Some(SubscribeFrame {
         pane_id,
+        is_initial: raw.is_initial,
         viewport_lines,
     }))
 }

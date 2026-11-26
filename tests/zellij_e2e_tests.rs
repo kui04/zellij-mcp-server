@@ -5,11 +5,12 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use zellij_mcp_server::domain::error::DomainError;
 use zellij_mcp_server::domain::ids::{
     CommandSpec, CompiledPattern, EnterPolicy, PaneClosePolicy, ReplInput, ReplName, ServiceName,
     SessionName, SessionResolution, WaitMode,
 };
-use zellij_mcp_server::domain::layout::PlacementRequest;
+use zellij_mcp_server::domain::layout::{LayoutConstraints, PlacementRequest, ResolvedPlacement};
 use zellij_mcp_server::runtime::{
     OrchestratorConfig, ReplExecRequest, ReplOpenRequest, ServiceStartRequest, TaskRunOutcome,
     TaskRunRequest, WorkspaceOrchestrator,
@@ -49,6 +50,7 @@ async fn real_zellij_task_service_and_repl_end_to_end() -> Result<()> {
             confirm_destructive: false,
             keep_session: false,
             default_cwd: std::env::current_dir()?,
+            layout_constraints: LayoutConstraints::default(),
         },
         client.clone(),
     );
@@ -65,12 +67,34 @@ async fn real_zellij_task_service_and_repl_end_to_end() -> Result<()> {
             confirm_destructive: false,
             keep_session: false,
             default_cwd: std::env::current_dir()?,
+            layout_constraints: LayoutConstraints::default(),
         },
         client.clone(),
     );
     second_orch.initialize().await?;
     second_orch.shutdown().await;
     assert!(client.session_exists().await?);
+
+    // 0b. Non-existent cwd must fail fast with InvalidCwd instead of silently falling back.
+    let Err(bad_cwd_err) = orch
+        .task_run(TaskRunRequest {
+            cmd: CommandSpec::parse(vec!["pwd".into()])?,
+            cwd: Some(PathBuf::from("/nope/definitely-does-not-exist-xyz")),
+            name: Some("bad-cwd".into()),
+            wait_timeout: Duration::from_secs(2),
+            placement: PlacementRequest::Auto,
+        })
+        .await
+    else {
+        panic!("expected InvalidCwd error");
+    };
+    assert!(
+        matches!(
+            bad_cwd_err.downcast_ref::<DomainError>(),
+            Some(DomainError::InvalidCwd { .. })
+        ),
+        "expected InvalidCwd, got: {bad_cwd_err:?}"
+    );
 
     // 1. Fast-path finite task + exact tail_lines check (no off-by-one trailing blank row)
     let (fast, _) = orch
@@ -117,7 +141,17 @@ async fn real_zellij_task_service_and_repl_end_to_end() -> Result<()> {
             placement: PlacementRequest::Stacked,
         })
         .await?;
-    assert!(matches!(stacked_fast, TaskRunOutcome::Completed { .. }));
+    match stacked_fast {
+        TaskRunOutcome::Completed {
+            placement,
+            layout_hint,
+            ..
+        } => {
+            assert_eq!(placement, ResolvedPlacement::Floating);
+            assert!(layout_hint.is_some());
+        }
+        TaskRunOutcome::Running { .. } => panic!("expected stacked task to complete"),
+    }
 
     // 2. Slow-path finite task + zero-polling task_wait
     let (slow, _) = orch
@@ -164,6 +198,9 @@ async fn real_zellij_task_service_and_repl_end_to_end() -> Result<()> {
         .await?;
     assert!(!svc.reused);
     assert_eq!(svc.status, "ready");
+    // In headless sessions (0 attached clients), background_tab honestly reports floating fallback.
+    assert_eq!(svc.placement, ResolvedPlacement::Floating);
+    assert!(svc.layout_hint.is_some());
 
     let (svc_reused, _) = orch
         .service_start(ServiceStartRequest {

@@ -62,6 +62,7 @@ pub struct ManagedEntityDto {
     pub tab_id: u32,
     pub placement: String,
     pub status: String,
+    pub pane_closed: bool,
     pub exit_code: Option<i32>,
 }
 
@@ -97,6 +98,10 @@ pub struct TaskRunResponse {
     pub task_id: String,
     pub pane_id: String,
     pub pane_name: String,
+    pub tab_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_name: Option<String>,
+    pub placement: String,
     pub status: String,
     pub elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -206,6 +211,10 @@ pub struct ServiceStartResponse {
     pub name: String,
     pub pane_id: String,
     pub pane_name: String,
+    pub tab_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_name: Option<String>,
+    pub placement: String,
     pub reused: bool,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -263,7 +272,7 @@ pub struct ReplOpenParams {
     pub cmd: Vec<String>,
     /// Optional working directory.
     pub cwd: Option<String>,
-    /// Optional regex matching the REPL prompt (e.g. `">>> "` or `"\(gdb\) "`).
+    /// Optional regex matching the waiting REPL prompt at end of line (e.g. `">>> "` or `"\(gdb\) "`).
     pub prompt_pattern: Option<String>,
     /// Semantic pane placement (default: `"auto"`).
     pub placement: Option<PlacementDto>,
@@ -274,7 +283,8 @@ pub struct ReplExecParams {
     pub name: String,
     /// Text to inject via bracketed paste (mutually exclusive with `keys`).
     pub input: Option<String>,
-    /// Special key chords sent via `send-keys` (mutually exclusive with `input`).
+    /// Special key chords sent via `send-keys` (mutually exclusive with `input`). Accepts Zellij
+    /// space syntax (`"Ctrl c"`, `"Alt Enter"`, `"Enter"`) as well as `"Ctrl+C"` / `"C-c"`.
     pub keys: Option<Vec<String>>,
     /// Whether to press Enter after pasting `input` (default: true).
     pub send_enter: Option<bool>,
@@ -289,7 +299,13 @@ pub struct ReplResponse {
     pub name: String,
     pub pane_id: String,
     pub pane_name: String,
+    pub tab_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_name: Option<String>,
+    pub placement: String,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
     pub output: String,
     pub timed_out: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]

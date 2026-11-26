@@ -15,7 +15,7 @@ long-lived background services, and stateful interactive REPL sessions inside re
 - **Incremental, ANSI-stripped logs**: maintains bounded per-entity log buffers with `since_seq`
   cursors and optional regex `grep` filtering.
 - **Viewport-adaptive pane placement**: inspects live Zellij tab dimensions and routes panes across
-  `narrow` (`<= 139` columns), `wide` (`140..219` columns), and `ultrawide` (`>= 220` columns)
+  `narrow` (`<= 159` columns), `wide` (`160..219` columns), and `ultrawide` (`>= 220` columns)
   layout tiers, including managed `agent:tasks` and `agent:services` tabs.
 - **Safe session lifecycle**: attaches to `--session` / `ZELLIJ_MCP_SESSION` or inherits
   `$ZELLIJ_SESSION_NAME` without tearing down user-owned sessions; when started outside Zellij,
@@ -62,13 +62,15 @@ zellij-mcp-server [OPTIONS]
 
 ### CLI flags and environment variables
 
-| Flag                    | Environment Variable | Default  | Description                                                                            |
-| ----------------------- | -------------------- | -------- | -------------------------------------------------------------------------------------- |
-| `--session <SESSION>`   | `ZELLIJ_MCP_SESSION` | Auto     | Target Zellij session name (overrides `$ZELLIJ_SESSION_NAME`).                         |
-| `--zellij-bin <PATH>`   | `ZELLIJ_BIN`         | `zellij` | Path to the `zellij` executable (`>= 0.46.1`).                                         |
-| `--confirm-destructive` | -                    | `false`  | Prompt via `zellij prompt confirm` before `task_cancel`, `service_stop`, `repl_close`. |
-| `--keep-session`        | -                    | `false`  | Keep a server-created Zellij session alive after the MCP server exits.                 |
-| -                       | `RUST_LOG`           | -        | Standard `tracing_subscriber` filter (logs are emitted to `stderr`).                   |
+| Flag                     | Environment Variable       | Default  | Description                                                                            |
+| ------------------------ | -------------------------- | -------- | -------------------------------------------------------------------------------------- |
+| `--session <SESSION>`    | `ZELLIJ_MCP_SESSION`       | Auto     | Target Zellij session name (overrides `$ZELLIJ_SESSION_NAME`).                         |
+| `--zellij-bin <PATH>`    | `ZELLIJ_BIN`               | `zellij` | Path to the `zellij` executable (`>= 0.46.1`).                                         |
+| `--confirm-destructive`  | -                          | `false`  | Prompt via `zellij prompt confirm` before `task_cancel`, `service_stop`, `repl_close`. |
+| `--keep-session`         | -                          | `false`  | Keep a server-created Zellij session alive after the MCP server exits.                 |
+| `--min-pane-cols <COLS>` | `ZELLIJ_MCP_MIN_PANE_COLS` | `80`     | Hard minimum columns per pane on horizontal split (`0` disables).                      |
+| `--min-pane-rows <ROWS>` | `ZELLIJ_MCP_MIN_PANE_ROWS` | `16`     | Hard minimum rows per pane on vertical split (`0` disables).                           |
+| -                        | `RUST_LOG`                 | -        | Standard `tracing_subscriber` filter (logs are emitted to `stderr`).                   |
 
 Session resolution precedence at startup:
 
@@ -101,9 +103,9 @@ Add `zellij-mcp-server` to your MCP client configuration (for example `.pi/mcp.j
 
 ### Workspace
 
-| Tool               | Parameters | Description                                                                                                                  |
-| ------------------ | ---------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `workspace_status` | `session?` | Lists all managed tasks, services, and REPLs, live viewport dimensions, `layout_tier`, `managed_tabs`, and `attach_command`. |
+| Tool               | Parameters | Description                                                                                                                                                                         |
+| ------------------ | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `workspace_status` | `session?` | Lists managed tasks, services, and REPLs (each with `pane_closed`), live viewport dimensions, `layout_tier`, `managed_tabs`, and `attach_command`. Retains up to 50 closed records. |
 
 ### Tasks (finite commands with exit codes)
 
@@ -125,11 +127,11 @@ Add `zellij-mcp-server` to your MCP client configuration (for example `.pi/mcp.j
 
 ### REPLs (stateful interactive sessions)
 
-| Tool         | Parameters                                                                  | Description                                                                                                                                      |
-| ------------ | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `repl_open`  | `name`, `cmd`, `cwd?`, `prompt_pattern?`, `placement?`                      | Opens or reuses a stateful interactive session (`python3`, `gdb`, `psql`, `ssh`) and waits for the initial prompt or quiet settle.               |
-| `repl_exec`  | `name`, `input?`, `keys?`, `send_enter?`, `wait_for_prompt?`, `timeout_ms?` | Injects bracketed-paste `input` or `send-keys` chords under a per-pane write lock and returns incremental output (`timeout_ms` default `15000`). |
-| `repl_close` | `name`                                                                      | Sends `Ctrl+D`, closes the REPL pane, and releases its write lock and stream subscription.                                                       |
+| Tool         | Parameters                                                                  | Description                                                                                                                                                                                                          |
+| ------------ | --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `repl_open`  | `name`, `cmd`, `cwd?`, `prompt_pattern?`, `placement?`                      | Opens or reuses a stateful interactive session (`python3`, `gdb`, `psql`, `ssh`), waits for the initial prompt or quiet settle, and returns `exit_code` if the process exits immediately.                            |
+| `repl_exec`  | `name`, `input?`, `keys?`, `send_enter?`, `wait_for_prompt?`, `timeout_ms?` | Injects bracketed-paste `input` or `send-keys` chords (accepts `"Ctrl c"`, `"Ctrl+C"`, `"C-c"`, `"Alt+Enter"`, `"Enter"`) under a per-pane write lock and returns incremental output (`timeout_ms` default `15000`). |
+| `repl_close` | `name`                                                                      | Sends `Ctrl+D`, closes the REPL pane, and releases its write lock and stream subscription.                                                                                                                           |
 
 ## Placement and Layout Tiers
 
@@ -140,13 +142,24 @@ Add `zellij-mcp-server` to your MCP client configuration (for example `.pi/mcp.j
 - `split_down`
 - `floating`
 - `stacked` (falls back to `floating` in headless sessions when no terminal client is attached)
-- `background_tab` (routes tasks to `agent:tasks` and services to `agent:services`)
+- `background_tab` (routes tasks to `agent:tasks` and services to `agent:services`; falls back to
+  `floating` in headless sessions with 0 attached clients)
 
 Layout tiers reported by `workspace_status.viewport.layout_tier`:
 
-- `narrow`: `<= 139` columns
-- `wide`: `140..219` columns
+- `narrow`: `<= 159` columns
+- `wide`: `160..219` columns
 - `ultrawide`: `>= 220` columns
+
+Before splitting the focused pane (`split_right` or `split_down`), the server checks the focused
+pane's live dimensions against `--min-pane-cols` (default `80`) and `--min-pane-rows` (default
+`16`). If a split would squeeze either half below those limits (or if Zellij reports
+`No room for a new pane`), the server automatically downgrades tasks/services to `background_tab`
+and REPLs to `floating`, returning the effective `placement`, `tab_id`, `tab_name`, and a `hint`
+explaining the change.
+
+> Note: Commands run inside Zellij panes are spawned by the Zellij server process and therefore
+> inherit the Zellij server's environment and `PATH` rather than the MCP client's `PATH`.
 
 ## Development
 

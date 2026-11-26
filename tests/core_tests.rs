@@ -12,8 +12,9 @@ use zellij_mcp_server::domain::ids::{
     TaskId, TerminalPaneId,
 };
 use zellij_mcp_server::domain::layout::{
-    EntityKind, LayoutRouter, LayoutState, LayoutTier, ManagedTabKind, PlacementRequest,
-    ResolvedPlacement, TargetTab, ViewportSnapshot,
+    EntityKind, FocusedPaneGeometry, LayoutConstraints, LayoutFallbackReason, LayoutRouter,
+    LayoutState, LayoutTier, ManagedTabKind, PlacementRequest, ResolvedPlacement, TargetTab,
+    ViewportSnapshot,
 };
 use zellij_mcp_server::domain::lifecycle::{
     EntityLifecycle, ServiceLifecycle, TaskLifecycle, VisualAction,
@@ -97,6 +98,33 @@ fn pane_ids_and_command_spec_enforced_at_boundary() -> Result<()> {
         ReplInput::parse(None, Some(vec!["Ctrl c".into()]), false)?,
         ReplInput::SendKeys(vec![KeyChord::parse("Ctrl c")?])
     );
+
+    // Key chord normalization converts common agent notations into Zellij `send-keys` syntax.
+    assert_eq!(KeyChord::parse("Ctrl+C")?.as_str(), "Ctrl c");
+    assert_eq!(KeyChord::parse("ctrl+d")?.as_str(), "Ctrl d");
+    assert_eq!(KeyChord::parse("Ctrl-C")?.as_str(), "Ctrl c");
+    assert_eq!(KeyChord::parse("ctrl-d")?.as_str(), "Ctrl d");
+    assert_eq!(KeyChord::parse("C-c")?.as_str(), "Ctrl c");
+    assert_eq!(KeyChord::parse("S-Tab")?.as_str(), "Shift Tab");
+    assert_eq!(KeyChord::parse("s-c")?.as_str(), "Super c");
+    assert_eq!(KeyChord::parse("Alt+Enter")?.as_str(), "Alt Enter");
+    assert_eq!(KeyChord::parse("Ctrl+Shift+A")?.as_str(), "Ctrl Shift A");
+    assert_eq!(KeyChord::parse("return")?.as_str(), "Enter");
+    assert_eq!(KeyChord::parse("esc")?.as_str(), "Esc");
+    assert_eq!(KeyChord::parse("page up")?.as_str(), "PageUp");
+    assert_eq!(KeyChord::parse("Ctrl page down")?.as_str(), "Ctrl PageDown");
+    assert_eq!(KeyChord::parse("+")?.as_str(), "+");
+
+    // Prompt matching requires the regex match to reach end-of-line so command echoes never match.
+    let py_prompt = CompiledPattern::parse("prompt_pattern", ">>> ")?;
+    assert!(py_prompt.matches_terminal_line(">>> "));
+    assert!(py_prompt.matches_terminal_line(">>>"));
+    assert!(!py_prompt.matches_terminal_line(">>> print('AAA')"));
+
+    let sh_prompt = CompiledPattern::parse("prompt_pattern", r"\$ ")?;
+    assert!(sh_prompt.matches_terminal_line("user@host:~/proj$ "));
+    assert!(sh_prompt.matches_terminal_line("user@host:~/proj$"));
+    assert!(!sh_prompt.matches_terminal_line("user@host:~/proj$ ls -la"));
     Ok(())
 }
 
@@ -141,14 +169,29 @@ fn layout_router_handles_three_width_tiers_and_adaptive_stacking() -> Result<()>
     layout.managed_tabs.tasks = Some(TabId::new(1));
     layout.managed_tabs.services = Some(TabId::new(2));
 
-    // Narrow screen (< 140 cols)
-    layout.viewport = Some(ViewportSnapshot::new(120, 40, 1));
+    // Narrow screen (<= 159 cols)
+    layout.viewport = Some(ViewportSnapshot::new(159, 40, 1));
     assert_eq!(layout.viewport.map(|v| v.tier), Some(LayoutTier::Narrow));
 
-    let repl_narrow = LayoutRouter::plan(&layout, EntityKind::Repl, PlacementRequest::Auto, 0, 0);
+    let constraints = LayoutConstraints::default();
+    let repl_narrow = LayoutRouter::plan(
+        &layout,
+        EntityKind::Repl,
+        PlacementRequest::Auto,
+        0,
+        0,
+        constraints,
+    );
     assert_eq!(repl_narrow.placement, ResolvedPlacement::Floating);
 
-    let svc_second = LayoutRouter::plan(&layout, EntityKind::Service, PlacementRequest::Auto, 0, 1);
+    let svc_second = LayoutRouter::plan(
+        &layout,
+        EntityKind::Service,
+        PlacementRequest::Auto,
+        0,
+        1,
+        constraints,
+    );
     assert_eq!(svc_second.placement, ResolvedPlacement::BackgroundTab);
     assert!(svc_second.open_stacked);
     assert_eq!(
@@ -160,21 +203,214 @@ fn layout_router_handles_three_width_tiers_and_adaptive_stacking() -> Result<()>
     );
 
     // 4th task in agent:tasks triggers swap-to-stacked
-    let fourth_task = LayoutRouter::plan(&layout, EntityKind::Task, PlacementRequest::Auto, 3, 0);
+    let fourth_task = LayoutRouter::plan(
+        &layout,
+        EntityKind::Task,
+        PlacementRequest::Auto,
+        3,
+        0,
+        constraints,
+    );
     assert!(fourth_task.trigger_tab_stack_swap);
 
     // Wide screen (140..=219 cols)
     layout.viewport = Some(ViewportSnapshot::new(200, 50, 1));
-    let wide_task = LayoutRouter::plan(&layout, EntityKind::Task, PlacementRequest::Auto, 0, 0);
+    layout.focused_pane = Some(FocusedPaneGeometry {
+        columns: 200,
+        rows: 50,
+    });
+    let wide_task = LayoutRouter::plan(
+        &layout,
+        EntityKind::Task,
+        PlacementRequest::Auto,
+        0,
+        0,
+        constraints,
+    );
     assert_eq!(wide_task.placement, ResolvedPlacement::SplitRight);
+    assert_eq!(wide_task.fallback_reason, None);
+
+    // Focused pane too narrow for another split (100 / 2 = 50 < 80) -> auto-downgrade
+    layout.focused_pane = Some(FocusedPaneGeometry {
+        columns: 100,
+        rows: 50,
+    });
+    let guarded_task = LayoutRouter::plan(
+        &layout,
+        EntityKind::Task,
+        PlacementRequest::SplitRight,
+        0,
+        0,
+        constraints,
+    );
+    assert_eq!(guarded_task.placement, ResolvedPlacement::BackgroundTab);
+    assert!(matches!(
+        guarded_task.fallback_reason,
+        Some(LayoutFallbackReason::MinWidthExceeded {
+            focused_cols: 100,
+            min_cols: 80,
+            ..
+        })
+    ));
+
+    let guarded_repl = LayoutRouter::plan(
+        &layout,
+        EntityKind::Repl,
+        PlacementRequest::SplitRight,
+        0,
+        0,
+        constraints,
+    );
+    assert_eq!(guarded_repl.placement, ResolvedPlacement::Floating);
+
+    // Focused pane too short for vertical split (30 / 2 = 15 < 16) -> auto-downgrade
+    layout.focused_pane = Some(FocusedPaneGeometry {
+        columns: 200,
+        rows: 30,
+    });
+    let guarded_down = LayoutRouter::plan(
+        &layout,
+        EntityKind::Task,
+        PlacementRequest::SplitDown,
+        0,
+        0,
+        constraints,
+    );
+    assert_eq!(guarded_down.placement, ResolvedPlacement::BackgroundTab);
+    assert!(matches!(
+        guarded_down.fallback_reason,
+        Some(LayoutFallbackReason::MinHeightExceeded {
+            focused_rows: 30,
+            min_rows: 16,
+            ..
+        })
+    ));
+
+    // Exact boundary: 160 / 2 == 80 (allowed) vs 159 / 2 == 79 (downgraded); 32 / 2 == 16 vs 31 / 2 == 15.
+    layout.focused_pane = Some(FocusedPaneGeometry {
+        columns: 160,
+        rows: 32,
+    });
+    assert_eq!(
+        LayoutRouter::plan(
+            &layout,
+            EntityKind::Task,
+            PlacementRequest::SplitRight,
+            0,
+            0,
+            constraints,
+        )
+        .placement,
+        ResolvedPlacement::SplitRight
+    );
+    assert_eq!(
+        LayoutRouter::plan(
+            &layout,
+            EntityKind::Task,
+            PlacementRequest::SplitDown,
+            0,
+            0,
+            constraints,
+        )
+        .placement,
+        ResolvedPlacement::SplitDown
+    );
+
+    layout.focused_pane = Some(FocusedPaneGeometry {
+        columns: 159,
+        rows: 31,
+    });
+    assert_eq!(
+        LayoutRouter::plan(
+            &layout,
+            EntityKind::Task,
+            PlacementRequest::SplitRight,
+            0,
+            0,
+            constraints,
+        )
+        .placement,
+        ResolvedPlacement::BackgroundTab
+    );
+    assert_eq!(
+        LayoutRouter::plan(
+            &layout,
+            EntityKind::Task,
+            PlacementRequest::SplitDown,
+            0,
+            0,
+            constraints,
+        )
+        .placement,
+        ResolvedPlacement::BackgroundTab
+    );
+
+    // Unknown focused pane geometry skips hard guard (left to Zellij no-room fallback).
+    layout.focused_pane = None;
+    assert_eq!(
+        LayoutRouter::plan(
+            &layout,
+            EntityKind::Task,
+            PlacementRequest::SplitRight,
+            0,
+            0,
+            constraints,
+        )
+        .placement,
+        ResolvedPlacement::SplitRight
+    );
+
+    // Zero disables the hard limit.
+    layout.focused_pane = Some(FocusedPaneGeometry {
+        columns: 200,
+        rows: 30,
+    });
+    let unconstrained = LayoutRouter::plan(
+        &layout,
+        EntityKind::Task,
+        PlacementRequest::SplitDown,
+        0,
+        0,
+        LayoutConstraints {
+            min_pane_cols: 0,
+            min_pane_rows: 0,
+        },
+    );
+    assert_eq!(unconstrained.placement, ResolvedPlacement::SplitDown);
 
     // Ultrawide screen (>= 220 cols)
     layout.viewport = Some(ViewportSnapshot::new(240, 60, 1));
-    let ultra_svc = LayoutRouter::plan(&layout, EntityKind::Service, PlacementRequest::Auto, 0, 0);
+    layout.focused_pane = Some(FocusedPaneGeometry {
+        columns: 240,
+        rows: 60,
+    });
+    let ultra_svc = LayoutRouter::plan(
+        &layout,
+        EntityKind::Service,
+        PlacementRequest::Auto,
+        0,
+        0,
+        constraints,
+    );
     assert_eq!(ultra_svc.placement, ResolvedPlacement::Stacked);
     assert_eq!(
         ultra_svc.target_tab,
         TargetTab::ActiveTab(Some(TabId::new(0)))
+    );
+
+    // Ultrawide task caps tiled panes at 3 instead of splitting infinitely.
+    layout.viewport = Some(ViewportSnapshot::new(240, 60, 3));
+    let ultra_task_overflow = LayoutRouter::plan(
+        &layout,
+        EntityKind::Task,
+        PlacementRequest::Auto,
+        0,
+        0,
+        constraints,
+    );
+    assert_eq!(
+        ultra_task_overflow.placement,
+        ResolvedPlacement::BackgroundTab
     );
     Ok(())
 }
@@ -216,6 +452,15 @@ fn bounded_log_buffer_and_viewport_diff_and_ansi_strip() -> Result<()> {
         diff_viewport(&prev_scroll, &curr_scroll),
         vec![">>> cmd", "ok"]
     );
+
+    // A single-line prompt `prev` must NOT match the newly rendered prompt at the bottom of `curr`.
+    let single_prompt = vec!["sh-5.2$".into()];
+    let after_cmd = vec![
+        "sh-5.2$ echo E2E_REPL_42".into(),
+        "E2E_REPL_42".into(),
+        "sh-5.2$".into(),
+    ];
+    assert_eq!(diff_viewport(&single_prompt, &after_cmd), after_cmd);
 
     assert_eq!(strip_ansi("\x1b[31mred\x1b[0m\x1b(B text"), "red text");
     assert_eq!(
@@ -301,6 +546,7 @@ fn state_store_transitions_gc_and_reconciliation() -> Result<()> {
 
     let ready_fx = store.apply_viewport_frame(
         svc_pane,
+        true,
         vec!["starting...".into(), "Local: http://localhost:3000".into()],
         t0 + Duration::from_secs(2),
     );
@@ -310,6 +556,32 @@ fn state_store_transitions_gc_and_reconciliation() -> Result<()> {
             .get_service(&svc_name)
             .map(|r| r.lifecycle.status_label()),
         Some("ready")
+    );
+
+    // Reconnect `is_initial: true` frame resets baseline without replaying prior lines.
+    let before_reconnect_len = store.get_service(&svc_name).map_or(0, |r| r.logs.len());
+    let _ = store.apply_viewport_frame(
+        svc_pane,
+        true,
+        vec!["starting...".into(), "Local: http://localhost:3000".into()],
+        t0 + Duration::from_secs(3),
+    );
+    assert_eq!(
+        store.get_service(&svc_name).map_or(0, |r| r.logs.len()),
+        before_reconnect_len
+    );
+
+    // `prune_closed_history` evicts only oldest closed terminal records while keeping open panes.
+    store.prune_closed_history(0);
+    assert!(
+        store
+            .get(&ManagedKey::Task(TaskId::parse("t_01")?))
+            .is_none()
+    );
+    assert!(
+        store
+            .get(&ManagedKey::Task(TaskId::parse("t_02")?))
+            .is_some()
     );
 
     let crash_fx = store.apply_event(
@@ -369,6 +641,8 @@ fn zellij_0_46_1_fixtures_parse_and_reconcile() -> Result<()> {
         .filter_map(|line| parse_subscribe_line(line).transpose())
         .collect::<Result<Vec<_>>>()?;
     assert_eq!(frames.len(), 2);
+    assert!(frames[0].is_initial);
+    assert!(!frames[1].is_initial);
     assert_eq!(frames[1].viewport_lines[1], "probe-line-2");
 
     // Cold-start reconciliation claims `[RUN] mcp:task:t_01:probe` as completed.

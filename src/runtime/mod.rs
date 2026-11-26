@@ -3,7 +3,7 @@
 pub mod cache;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -20,8 +20,8 @@ use crate::domain::ids::{
     TerminalPaneId, WaitMode,
 };
 use crate::domain::layout::{
-    EntityKind, LayoutRouter, ManagedTabKind, PlacementRequest, ResolvedPlacement, TabMode,
-    TargetTab,
+    EntityKind, LayoutConstraints, LayoutFallbackReason, LayoutRouter, ManagedTabKind,
+    PlacementRequest, ResolvedPlacement, TabMode, TargetTab,
 };
 use crate::domain::lifecycle::{
     EntityLifecycle, ReplLifecycle, ServiceLifecycle, TaskLifecycle, VisualAction, WorkspaceAlert,
@@ -74,6 +74,7 @@ pub struct OrchestratorConfig {
     pub confirm_destructive: bool,
     pub keep_session: bool,
     pub default_cwd: PathBuf,
+    pub layout_constraints: LayoutConstraints,
 }
 
 /// Request payload for `task_run` after boundary parsing.
@@ -100,6 +101,10 @@ pub enum TaskRunOutcome {
         task_id: TaskId,
         pane_id: TerminalPaneId,
         pane_title: String,
+        tab_id: TabId,
+        tab_name: Option<String>,
+        placement: ResolvedPlacement,
+        layout_hint: Option<String>,
         status: &'static str,
         exit_code: Option<i32>,
         elapsed_ms: u64,
@@ -109,6 +114,10 @@ pub enum TaskRunOutcome {
         task_id: TaskId,
         pane_id: TerminalPaneId,
         pane_title: String,
+        tab_id: TabId,
+        tab_name: Option<String>,
+        placement: ResolvedPlacement,
+        layout_hint: Option<String>,
         elapsed_ms: u64,
         tail_preview: String,
     },
@@ -149,6 +158,10 @@ pub struct ServiceStartOutcome {
     pub name: ServiceName,
     pub pane_id: TerminalPaneId,
     pub pane_title: String,
+    pub tab_id: TabId,
+    pub tab_name: Option<String>,
+    pub placement: ResolvedPlacement,
+    pub layout_hint: Option<String>,
     pub reused: bool,
     pub status: &'static str,
     pub matched_line: Option<String>,
@@ -180,7 +193,12 @@ pub struct ReplExecOutcome {
     pub name: ReplName,
     pub pane_id: TerminalPaneId,
     pub pane_title: String,
+    pub tab_id: TabId,
+    pub tab_name: Option<String>,
+    pub placement: ResolvedPlacement,
+    pub layout_hint: Option<String>,
     pub status: &'static str,
+    pub exit_code: Option<i32>,
     pub delta_output: String,
     pub timed_out: bool,
 }
@@ -224,6 +242,18 @@ fn is_session_not_found(err: &anyhow::Error) -> bool {
 fn is_headless_stacked_error(err: &anyhow::Error) -> bool {
     err.to_string()
         .contains("A connected client or a target pane is required")
+}
+
+fn is_no_room_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains("No room for a new pane")
+}
+
+struct SpawnedPane {
+    tab_id: TabId,
+    tab_name: Option<String>,
+    pane_id: TerminalPaneId,
+    placement: ResolvedPlacement,
+    layout_hint: Option<String>,
 }
 
 impl WorkspaceOrchestrator {
@@ -376,13 +406,26 @@ impl WorkspaceOrchestrator {
     pub async fn inject_viewport_frame(&self, frame: SubscribeFrame) {
         let effects = {
             let mut store = self.inner.state.write().await;
-            store.apply_viewport_frame(frame.pane_id, frame.viewport_lines, SystemTime::now())
+            store.apply_viewport_frame(
+                frame.pane_id,
+                frame.is_initial,
+                frame.viewport_lines,
+                SystemTime::now(),
+            )
         };
         self.apply_effects(effects).await;
     }
 
     async fn apply_effects(&self, effects: TransitionEffects) {
+        // Snapshot full scrollback immediately when a process exits (while its pane is still open
+        // in Zellij) so logs remain available even if the pane is later closed externally.
+        for pane_id in &effects.exited_panes {
+            self.backfill_pane_logs_by_pane_id(*pane_id).await;
+        }
         for action in &effects.visual_actions {
+            if let VisualAction::ClosePane { pane_id } = action {
+                self.backfill_pane_logs_by_pane_id(*pane_id).await;
+            }
             if let Err(err) = self.inner.client.apply_visual_action(action).await {
                 warn!(?action, error = %err, "visual action failed");
             }
@@ -466,39 +509,52 @@ impl WorkspaceOrchestrator {
         Ok(())
     }
 
-    async fn resolve_target_tab_and_spawn(
-        &self,
-        kind: EntityKind,
-        request: PlacementRequest,
-        pane_title: String,
-        cwd: PathBuf,
-        cmd: CommandSpec,
-    ) -> Result<(TabId, TerminalPaneId, ResolvedPlacement)> {
-        let plan = {
-            let store = self.inner.state.read().await;
-            let active_tasks = store
-                .layout
-                .managed_tabs
-                .tasks
-                .map_or(0, |t| store.count_active_in_tab(t));
-            let active_services = store
-                .layout
-                .managed_tabs
-                .services
-                .map_or(0, |t| store.count_active_in_tab(t));
-            LayoutRouter::plan(&store.layout, kind, request, active_tasks, active_services)
+    async fn validate_cwd(&self, cwd: Option<&Path>) -> Result<()> {
+        let Some(path) = cwd else {
+            return Ok(());
         };
-
-        let mut tab_fell_back = false;
-        let target_tab_id = match plan.target_tab {
-            TargetTab::ActiveTab(id) => id,
-            TargetTab::ManagedTab {
-                kind: tab_kind,
-                existing: Some(tab_id),
-            } => {
-                let _ = tab_kind;
-                Some(tab_id)
+        match tokio::fs::metadata(path).await {
+            Ok(meta) if meta.is_dir() => Ok(()),
+            Ok(_) => Err(DomainError::InvalidCwd {
+                path: path.to_path_buf(),
+                reason: "path is not a directory".to_owned(),
             }
+            .into()),
+            Err(err) => Err(DomainError::InvalidCwd {
+                path: path.to_path_buf(),
+                reason: err.to_string(),
+            }
+            .into()),
+        }
+    }
+
+    async fn refresh_layout_snapshot(&self) -> Result<()> {
+        let joined = tokio::try_join!(
+            self.inner.client.list_tabs(),
+            self.inner.client.list_panes(),
+            self.inner.client.current_tab_info(),
+        );
+        let (tabs, panes, active_tab) = match joined {
+            Ok(res) => res,
+            Err(err) => {
+                if is_session_not_found(&err) {
+                    self.mark_session_dead().await;
+                }
+                return Err(err);
+            }
+        };
+        let mut store = self.inner.state.write().await;
+        store.update_layout_snapshot(&tabs, active_tab.as_ref(), &panes);
+        Ok(())
+    }
+
+    async fn provision_target_tab(&self, target: TargetTab) -> Result<(Option<TabId>, bool)> {
+        match target {
+            TargetTab::ActiveTab(id) => Ok((id, false)),
+            TargetTab::ManagedTab {
+                kind: _,
+                existing: Some(tab_id),
+            } => Ok((Some(tab_id), false)),
             TargetTab::ManagedTab {
                 kind: tab_kind,
                 existing: None,
@@ -538,23 +594,81 @@ impl WorkspaceOrchestrator {
                             store.layout.managed_tabs.services = Some(created)
                         }
                     }
-                    Some(created)
+                    Ok((Some(created), false))
                 } else {
-                    tab_fell_back = true;
                     let store = self.inner.state.read().await;
-                    store.layout.active_tab_id
+                    Ok((store.layout.active_tab_id, true))
                 }
             }
+        }
+    }
+
+    async fn resolve_target_tab_and_spawn(
+        &self,
+        kind: EntityKind,
+        request: PlacementRequest,
+        pane_title: String,
+        cwd: PathBuf,
+        cmd: CommandSpec,
+    ) -> Result<SpawnedPane> {
+        // Refresh live tab/pane geometry only when the placement decision depends on viewport or
+        // focused pane dimensions; explicit floating/stacked/background_tab requests skip the
+        // extra CLI round-trips.
+        if matches!(
+            request,
+            PlacementRequest::Auto | PlacementRequest::SplitRight | PlacementRequest::SplitDown
+        ) {
+            self.refresh_layout_snapshot().await?;
+        }
+
+        let plan = {
+            let store = self.inner.state.read().await;
+            let active_tasks = store
+                .layout
+                .managed_tabs
+                .tasks
+                .map_or(0, |t| store.count_active_in_tab(t));
+            let active_services = store
+                .layout
+                .managed_tabs
+                .services
+                .map_or(0, |t| store.count_active_in_tab(t));
+            LayoutRouter::plan(
+                &store.layout,
+                kind,
+                request,
+                active_tasks,
+                active_services,
+                self.inner.config.layout_constraints,
+            )
         };
 
-        // When `background_tab` could not materialize a new tab in a headless session, avoid
-        // requesting `--stacked` on the fallback tab (which fails without a connected client).
+        let (mut target_tab_id, mut tab_fell_back) =
+            self.provision_target_tab(plan.target_tab).await?;
+
+        // When `background_tab` could not materialize a new tab in a headless session (0 attached
+        // clients), fall back immediately to a floating pane instead of silently splitting the
+        // 50x48 active tab and reporting a misleading `background_tab` placement.
+        let mut effective_placement = if tab_fell_back {
+            ResolvedPlacement::Floating
+        } else {
+            plan.placement
+        };
         let initial_stacked = if tab_fell_back {
             false
         } else {
             plan.open_stacked
         };
-        let mut effective_placement = plan.placement;
+        let mut fallback_reason = if tab_fell_back {
+            plan.fallback_reason
+                .or(Some(LayoutFallbackReason::HeadlessFallback {
+                    requested: plan.placement,
+                }))
+        } else {
+            plan.fallback_reason
+        };
+        let mut trigger_tab_stack_swap = plan.trigger_tab_stack_swap;
+
         let initial_spec = NewPaneSpec {
             tab_id: target_tab_id,
             name: pane_title.clone(),
@@ -570,6 +684,74 @@ impl WorkspaceOrchestrator {
                 self.mark_session_dead().await;
                 return Err(err);
             }
+            Err(err) if is_no_room_error(&err) => {
+                let downgrade_placement = match kind {
+                    EntityKind::Repl => ResolvedPlacement::Floating,
+                    EntityKind::Task | EntityKind::Service => ResolvedPlacement::BackgroundTab,
+                };
+                warn!(
+                    requested = ?effective_placement,
+                    downgrade = ?downgrade_placement,
+                    error = %err,
+                    "new-pane failed due to insufficient room; downgrading placement"
+                );
+                let reason = LayoutFallbackReason::NoRoomForNewPane {
+                    requested: effective_placement,
+                };
+                let fb_plan = {
+                    let store = self.inner.state.read().await;
+                    let active_tasks = store
+                        .layout
+                        .managed_tabs
+                        .tasks
+                        .map_or(0, |t| store.count_active_in_tab(t));
+                    let active_services = store
+                        .layout
+                        .managed_tabs
+                        .services
+                        .map_or(0, |t| store.count_active_in_tab(t));
+                    LayoutRouter::plan_fallback(
+                        &store.layout,
+                        kind,
+                        downgrade_placement,
+                        active_tasks,
+                        active_services,
+                        reason,
+                    )
+                };
+                let (fb_tab_id, fb_tab_fell_back) =
+                    self.provision_target_tab(fb_plan.target_tab).await?;
+                target_tab_id = fb_tab_id;
+                tab_fell_back = fb_tab_fell_back;
+                effective_placement = if fb_tab_fell_back {
+                    ResolvedPlacement::Floating
+                } else {
+                    fb_plan.placement
+                };
+                fallback_reason = fb_plan.fallback_reason;
+                trigger_tab_stack_swap = fb_plan.trigger_tab_stack_swap;
+                let fb_spec = NewPaneSpec {
+                    tab_id: target_tab_id,
+                    name: pane_title,
+                    placement: effective_placement,
+                    stacked: if fb_tab_fell_back {
+                        false
+                    } else {
+                        fb_plan.open_stacked
+                    },
+                    cwd: Some(cwd),
+                    cmd,
+                };
+                match self.inner.client.new_pane(&fb_spec).await {
+                    Ok(id) => id,
+                    Err(fb_err) => {
+                        if is_session_not_found(&fb_err) {
+                            self.mark_session_dead().await;
+                        }
+                        return Err(fb_err);
+                    }
+                }
+            }
             Err(err)
                 if is_headless_stacked_error(&err)
                     || (tab_fell_back && effective_placement != ResolvedPlacement::Floating) =>
@@ -581,6 +763,10 @@ impl WorkspaceOrchestrator {
                     error = %err,
                     "new-pane failed in headless/fallback layout; retrying as floating pane"
                 );
+                fallback_reason =
+                    fallback_reason.or(Some(LayoutFallbackReason::HeadlessFallback {
+                        requested: effective_placement,
+                    }));
                 effective_placement = ResolvedPlacement::Floating;
                 let fallback_spec = NewPaneSpec {
                     tab_id: target_tab_id,
@@ -603,7 +789,7 @@ impl WorkspaceOrchestrator {
             Err(err) => return Err(err),
         };
 
-        if plan.trigger_tab_stack_swap
+        if trigger_tab_stack_swap
             && !tab_fell_back
             && let Some(tab_id) = target_tab_id
             && self.inner.client.apply_stacked_layout(tab_id).await?
@@ -613,7 +799,17 @@ impl WorkspaceOrchestrator {
         }
 
         let effective_tab_id = target_tab_id.unwrap_or(TabId::new(0));
-        Ok((effective_tab_id, pane_id, effective_placement))
+        let tab_name = self.inner.state.read().await.tab_name_for(effective_tab_id);
+        let layout_hint = fallback_reason
+            .map(|reason| reason.format_hint(effective_placement, tab_name.as_deref()));
+
+        Ok(SpawnedPane {
+            tab_id: effective_tab_id,
+            tab_name,
+            pane_id,
+            placement: effective_placement,
+            layout_hint,
+        })
     }
 
     async fn maybe_confirm_destructive(&self, message: &str) -> Result<()> {
@@ -631,18 +827,68 @@ impl WorkspaceOrchestrator {
         Ok(())
     }
 
+    async fn refresh_viewport_best_effort(&self, pane_id: TerminalPaneId) -> Result<()> {
+        if self.inner.client.binary_path().is_none() {
+            return Ok(());
+        }
+        match self.inner.client.dump_viewport(pane_id).await {
+            Ok(raw) => {
+                let lines: Vec<String> = raw.lines().map(ToOwned::to_owned).collect();
+                self.inject_viewport_frame(SubscribeFrame {
+                    pane_id,
+                    is_initial: false,
+                    viewport_lines: lines,
+                })
+                .await;
+                Ok(())
+            }
+            Err(err) if is_session_not_found(&err) => {
+                self.mark_session_dead().await;
+                Err(err)
+            }
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// Backfills `record.logs` from `dump-screen --full` so logs survive external pane closure.
+    async fn backfill_pane_logs(&self, pane_id: TerminalPaneId, key: &ManagedKey) -> Vec<String> {
+        let Ok(raw) = self.inner.client.dump_screen(pane_id, false).await else {
+            return Vec::new();
+        };
+        let cleaned = strip_ansi(&raw);
+        let all_lines: Vec<String> = cleaned.lines().map(ToOwned::to_owned).collect();
+        let trimmed = trim_trailing_blank_lines(&all_lines).to_vec();
+        if !trimmed.is_empty() {
+            let mut store = self.inner.state.write().await;
+            if let Some(rec) = store.get_mut(key)
+                && rec.logs.len() < trimmed.len()
+            {
+                let mut rebuilt = BoundedLogBuffer::default();
+                let _ = rebuilt.push_lines(trimmed.iter().cloned());
+                rec.logs = rebuilt;
+            }
+        }
+        trimmed
+    }
+
+    async fn backfill_pane_logs_by_pane_id(&self, pane_id: TerminalPaneId) {
+        let key = {
+            let store = self.inner.state.read().await;
+            store.get_by_pane(pane_id).map(|r| r.key.clone())
+        };
+        if let Some(key) = key {
+            let _ = self.backfill_pane_logs(pane_id, &key).await;
+        }
+    }
+
     async fn read_task_output_truncated(
         &self,
         pane_id: TerminalPaneId,
         key: &ManagedKey,
     ) -> String {
-        if let Ok(raw) = self.inner.client.dump_screen(pane_id, false).await {
-            let cleaned = strip_ansi(&raw);
-            let all_lines: Vec<String> = cleaned.lines().map(ToOwned::to_owned).collect();
-            let trimmed = trim_trailing_blank_lines(&all_lines);
-            if !trimmed.is_empty() {
-                return truncate_head_tail(trimmed, DEFAULT_TRUNCATE_HEAD, DEFAULT_TRUNCATE_TAIL);
-            }
+        let dumped = self.backfill_pane_logs(pane_id, key).await;
+        if !dumped.is_empty() {
+            return truncate_head_tail(&dumped, DEFAULT_TRUNCATE_HEAD, DEFAULT_TRUNCATE_TAIL);
         }
         let store = self.inner.state.read().await;
         store
@@ -668,6 +914,8 @@ impl WorkspaceOrchestrator {
         &self,
         req: TaskRunRequest,
     ) -> Result<(TaskRunOutcome, Vec<WorkspaceAlert>)> {
+        self.validate_cwd(req.cwd.as_deref()).await?;
+
         let started_instant = Instant::now();
         let now = SystemTime::now();
         let task_id = {
@@ -684,7 +932,7 @@ impl WorkspaceOrchestrator {
             .cwd
             .unwrap_or_else(|| self.inner.config.default_cwd.clone());
 
-        let (tab_id, pane_id, placement) = {
+        let spawned = {
             let _guard = self.inner.provision_lock.lock().await;
             self.resolve_target_tab_and_spawn(
                 EntityKind::Task,
@@ -695,6 +943,11 @@ impl WorkspaceOrchestrator {
             )
             .await?
         };
+        let tab_id = spawned.tab_id;
+        let tab_name = spawned.tab_name;
+        let pane_id = spawned.pane_id;
+        let placement = spawned.placement;
+        let layout_hint = spawned.layout_hint;
 
         let early_effects = {
             let mut store = self.inner.state.write().await;
@@ -739,6 +992,10 @@ impl WorkspaceOrchestrator {
                             task_id,
                             pane_id,
                             pane_title: title,
+                            tab_id,
+                            tab_name,
+                            placement,
+                            layout_hint,
                             status,
                             exit_code,
                             elapsed_ms: u64::try_from(started_instant.elapsed().as_millis())
@@ -757,6 +1014,9 @@ impl WorkspaceOrchestrator {
             }
         }
 
+        // Refresh viewport once so background-tab tasks return a fresh tail_preview.
+        let _ = self.refresh_viewport_best_effort(pane_id).await;
+
         let mut store = self.inner.state.write().await;
         let tail_preview = store
             .get(&key)
@@ -768,6 +1028,10 @@ impl WorkspaceOrchestrator {
                 task_id,
                 pane_id,
                 pane_title,
+                tab_id,
+                tab_name,
+                placement,
+                layout_hint,
                 elapsed_ms: u64::try_from(started_instant.elapsed().as_millis())
                     .unwrap_or(u64::MAX),
                 tail_preview,
@@ -880,22 +1144,28 @@ impl WorkspaceOrchestrator {
                 .ok_or_else(|| DomainError::TaskNotFound(task_id.clone()))?
         };
 
-        let pane_closed = matches!(
-            record.lifecycle,
-            EntityLifecycle::Task(
-                TaskLifecycle::Completed {
-                    pane_closed: true,
-                    ..
-                } | TaskLifecycle::Cancelled {
-                    pane_closed: true,
-                    ..
-                } | TaskLifecycle::StoppedByUser { .. }
-            )
-        );
+        let pane_closed = record.lifecycle.is_pane_closed();
 
-        let output = if !record.lifecycle.is_active() && !pane_closed {
+        // Query `dump-screen --full` whenever the pane is still open (including running tasks in
+        // unfocused background tabs where `zellij subscribe` stops emitting frames), falling back
+        // to the in-memory ring buffer if the pane was closed externally.
+        let output = if !pane_closed {
             match self.inner.client.dump_screen(record.pane_id, false).await {
-                Ok(raw) => filter_and_tail_lines(&raw, tail_lines, grep).join("\n"),
+                Ok(raw) => {
+                    let filtered = filter_and_tail_lines(&raw, tail_lines, grep);
+                    if !filtered.is_empty() || record.logs.is_empty() {
+                        filtered.join("\n")
+                    } else {
+                        record
+                            .logs
+                            .query(None, tail_lines, grep)
+                            .entries
+                            .into_iter()
+                            .map(|e| e.line)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                }
                 Err(err) if is_session_not_found(&err) => {
                     self.mark_session_dead().await;
                     return Err(err);
@@ -989,6 +1259,7 @@ impl WorkspaceOrchestrator {
         let mut visual_actions = Vec::new();
         let pane_closed = close_policy == PaneClosePolicy::ClosePane;
         if pane_closed {
+            let _ = self.backfill_pane_logs(record.pane_id, &key).await;
             visual_actions.push(VisualAction::ClosePane {
                 pane_id: record.pane_id,
             });
@@ -1029,6 +1300,10 @@ impl WorkspaceOrchestrator {
                 } else if pane_closed
                     && let EntityLifecycle::Task(
                         TaskLifecycle::Completed {
+                            pane_closed: closed,
+                            ..
+                        }
+                        | TaskLifecycle::Failed {
                             pane_closed: closed,
                             ..
                         }
@@ -1090,7 +1365,7 @@ impl WorkspaceOrchestrator {
         req: ServiceStartRequest,
     ) -> Result<(ServiceStartOutcome, Vec<WorkspaceAlert>)> {
         let key = ManagedKey::Service(req.name.clone());
-        let (pane_id, pane_title, has_ready_pattern) = {
+        let (pane_id, pane_title, tab_id, tab_name, placement, layout_hint, has_ready_pattern) = {
             let _guard = self.inner.provision_lock.lock().await;
             {
                 let mut store = self.inner.state.write().await;
@@ -1114,10 +1389,16 @@ impl WorkspaceOrchestrator {
                         | EntityLifecycle::Task(_)
                         | EntityLifecycle::Repl(_) => None,
                     };
+                    let existing_tab_id = existing.tab_id;
+                    let existing_tab_name = store.tab_name_for(existing_tab_id);
                     let outcome = ServiceStartOutcome {
                         name: req.name,
                         pane_id: existing.pane_id,
                         pane_title: existing.pane_title.clone(),
+                        tab_id: existing_tab_id,
+                        tab_name: existing_tab_name,
+                        placement: existing.placement,
+                        layout_hint: None,
                         reused: true,
                         status: existing.lifecycle.status_label(),
                         matched_line,
@@ -1127,6 +1408,8 @@ impl WorkspaceOrchestrator {
                     return Ok((outcome, alerts));
                 }
             }
+
+            self.validate_cwd(req.cwd.as_deref()).await?;
 
             let now = SystemTime::now();
             let initial_badge = if req.ready_pattern.is_some() {
@@ -1139,7 +1422,7 @@ impl WorkspaceOrchestrator {
                 .cwd
                 .unwrap_or_else(|| self.inner.config.default_cwd.clone());
 
-            let (tab_id, pane_id, placement) = self
+            let spawned = self
                 .resolve_target_tab_and_spawn(
                     EntityKind::Service,
                     req.placement,
@@ -1148,6 +1431,11 @@ impl WorkspaceOrchestrator {
                     req.cmd.clone(),
                 )
                 .await?;
+            let tab_id = spawned.tab_id;
+            let tab_name = spawned.tab_name;
+            let pane_id = spawned.pane_id;
+            let placement = spawned.placement;
+            let layout_hint = spawned.layout_hint;
 
             let has_ready_pattern = req.ready_pattern.is_some();
             let lifecycle = if let Some(pat) = req.ready_pattern.clone() {
@@ -1184,11 +1472,20 @@ impl WorkspaceOrchestrator {
             self.apply_effects(early_effects).await;
             self.sync_subscriptions().await;
             self.persist_cache_best_effort().await;
-            (pane_id, pane_title, has_ready_pattern)
+            (
+                pane_id,
+                pane_title,
+                tab_id,
+                tab_name,
+                placement,
+                layout_hint,
+                has_ready_pattern,
+            )
         };
 
         if has_ready_pattern {
             let deadline = tokio::time::Instant::now() + req.ready_timeout;
+            let probe_interval = Duration::from_millis(250);
             let mut gen_rx = self.subscribe_state_gen();
             loop {
                 let _ = *gen_rx.borrow_and_update();
@@ -1204,13 +1501,39 @@ impl WorkspaceOrchestrator {
                 if settled {
                     break;
                 }
-                if tokio::time::timeout_at(deadline, gen_rx.changed())
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                // Zellij `subscribe` only emits incremental frames for panes in the currently
+                // focused tab; probe background-tab services periodically via `dump-screen`.
+                let wait_until = if self.inner.client.binary_path().is_some() {
+                    (now + probe_interval).min(deadline)
+                } else {
+                    deadline
+                };
+                if tokio::time::timeout_at(wait_until, gen_rx.changed())
                     .await
                     .is_err()
                 {
-                    break;
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    self.refresh_viewport_best_effort(pane_id).await?;
                 }
             }
+        }
+
+        // If the service crashed immediately or timed out with empty logs, backfill from screen so
+        // error messages such as `Command not found` are surfaced in `tail_preview`.
+        let needs_backfill = {
+            let store = self.inner.state.read().await;
+            store
+                .get(&key)
+                .is_some_and(|r| r.logs.is_empty() && !r.lifecycle.is_pane_closed())
+        };
+        if needs_backfill {
+            let _ = self.backfill_pane_logs(pane_id, &key).await;
         }
 
         let mut store = self.inner.state.write().await;
@@ -1233,6 +1556,10 @@ impl WorkspaceOrchestrator {
                 name: req.name,
                 pane_id: rec.pane_id,
                 pane_title: rec.pane_title.clone(),
+                tab_id: rec.tab_id,
+                tab_name,
+                placement: rec.placement,
+                layout_hint,
                 reused: false,
                 status: rec.lifecycle.status_label(),
                 matched_line,
@@ -1243,6 +1570,10 @@ impl WorkspaceOrchestrator {
                 name: req.name,
                 pane_id,
                 pane_title,
+                tab_id,
+                tab_name,
+                placement,
+                layout_hint,
                 reused: false,
                 status: "starting",
                 matched_line: None,
@@ -1261,6 +1592,17 @@ impl WorkspaceOrchestrator {
         grep: Option<&CompiledPattern>,
     ) -> Result<(LogSlice, Vec<WorkspaceAlert>)> {
         self.ensure_session_alive().await?;
+        let active_pane = {
+            let store = self.inner.state.read().await;
+            let rec = store
+                .get_service(name)
+                .ok_or_else(|| DomainError::ServiceNotFound(name.clone()))?;
+            rec.lifecycle.is_active().then_some(rec.pane_id)
+        };
+        if let Some(pane_id) = active_pane {
+            self.refresh_viewport_best_effort(pane_id).await?;
+        }
+
         let mut store = self.inner.state.write().await;
         let rec = store
             .get_service(name)
@@ -1379,6 +1721,7 @@ impl WorkspaceOrchestrator {
                 rec.lifecycle = EntityLifecycle::Service(ServiceLifecycle::Stopped {
                     started_at,
                     ended_at: SystemTime::now(),
+                    pane_closed: close_policy == PaneClosePolicy::ClosePane,
                 });
                 rec.pane_title = title;
             }
@@ -1402,19 +1745,26 @@ impl WorkspaceOrchestrator {
         req: ReplOpenRequest,
     ) -> Result<(ReplExecOutcome, Vec<WorkspaceAlert>)> {
         let key = ManagedKey::Repl(req.name.clone());
-        let (pane_id, now) = {
+        let (pane_id, tab_id, tab_name, placement, layout_hint, now) = {
             let _guard = self.inner.provision_lock.lock().await;
             {
                 let mut store = self.inner.state.write().await;
                 if let Some(existing) = store.get_repl(&req.name)
                     && existing.lifecycle.is_active()
                 {
+                    let existing_tab_id = existing.tab_id;
+                    let existing_tab_name = store.tab_name_for(existing_tab_id);
                     let outcome = ReplExecOutcome {
                         name: req.name,
                         pane_id: existing.pane_id,
                         pane_title: existing.pane_title.clone(),
+                        tab_id: existing_tab_id,
+                        tab_name: existing_tab_name,
+                        placement: existing.placement,
+                        layout_hint: None,
                         status: existing.lifecycle.status_label(),
-                        delta_output: existing.logs.tail_preview(30),
+                        exit_code: existing.lifecycle.exit_code(),
+                        delta_output: existing.logs.tail_preview(10),
                         timed_out: false,
                     };
                     let alerts = store.drain_alerts();
@@ -1422,13 +1772,15 @@ impl WorkspaceOrchestrator {
                 }
             }
 
+            self.validate_cwd(req.cwd.as_deref()).await?;
+
             let now = SystemTime::now();
             let pane_title = PaneTitleCodec::format("[RUN]", &key, None);
             let cwd = req
                 .cwd
                 .unwrap_or_else(|| self.inner.config.default_cwd.clone());
 
-            let (tab_id, pane_id, placement) = self
+            let spawned = self
                 .resolve_target_tab_and_spawn(
                     EntityKind::Repl,
                     req.placement,
@@ -1437,6 +1789,11 @@ impl WorkspaceOrchestrator {
                     req.cmd.clone(),
                 )
                 .await?;
+            let tab_id = spawned.tab_id;
+            let tab_name = spawned.tab_name;
+            let pane_id = spawned.pane_id;
+            let placement = spawned.placement;
+            let layout_hint = spawned.layout_hint;
 
             let early_effects = {
                 let mut store = self.inner.state.write().await;
@@ -1459,10 +1816,10 @@ impl WorkspaceOrchestrator {
             self.apply_effects(early_effects).await;
             self.sync_subscriptions().await;
             self.persist_cache_best_effort().await;
-            (pane_id, now)
+            (pane_id, tab_id, tab_name, placement, layout_hint, now)
         };
 
-        let (delta_output, timed_out) = self
+        let (mut delta_output, timed_out) = self
             .await_repl_output(
                 &key,
                 LogSeq::new(1),
@@ -1471,7 +1828,7 @@ impl WorkspaceOrchestrator {
             )
             .await?;
 
-        let (status, pane_title, rename_action) = {
+        let (status, exit_code, pane_title, rename_action) = {
             let mut store = self.inner.state.write().await;
             if let Some(rec) = store.get_mut(&key) {
                 if rec.lifecycle.is_active() {
@@ -1480,6 +1837,7 @@ impl WorkspaceOrchestrator {
                     rec.pane_title = ready_title.clone();
                     (
                         rec.lifecycle.status_label(),
+                        None,
                         ready_title.clone(),
                         Some(VisualAction::RenamePane {
                             pane_id,
@@ -1487,16 +1845,30 @@ impl WorkspaceOrchestrator {
                         }),
                     )
                 } else {
-                    (rec.lifecycle.status_label(), rec.pane_title.clone(), None)
+                    (
+                        rec.lifecycle.status_label(),
+                        rec.lifecycle.exit_code(),
+                        rec.pane_title.clone(),
+                        None,
+                    )
                 }
             } else {
                 (
                     "stopped",
+                    None,
                     PaneTitleCodec::format("[STOP]", &key, None),
                     None,
                 )
             }
         };
+
+        if status != "ready" && delta_output.trim().is_empty() {
+            let dumped = self.backfill_pane_logs(pane_id, &key).await;
+            if !dumped.is_empty() {
+                delta_output =
+                    truncate_head_tail(&dumped, DEFAULT_TRUNCATE_HEAD, DEFAULT_TRUNCATE_TAIL);
+            }
+        }
 
         if let Some(action) = rename_action {
             let _ = self.inner.client.apply_visual_action(&action).await;
@@ -1508,7 +1880,12 @@ impl WorkspaceOrchestrator {
                 name: req.name,
                 pane_id,
                 pane_title,
+                tab_id,
+                tab_name,
+                placement,
+                layout_hint,
                 status,
+                exit_code,
                 delta_output,
                 timed_out,
             },
@@ -1587,7 +1964,7 @@ impl WorkspaceOrchestrator {
             .await?;
 
         let needs_human_input = timed_out && interactive_auth_regex().is_match(&delta_output);
-        let (status, pane_title) = {
+        let (status, exit_code, pane_title) = {
             let mut store = self.inner.state.write().await;
             if let Some(rec) = store.get_mut(&key) {
                 let started_at = rec.lifecycle.started_at();
@@ -1629,25 +2006,41 @@ impl WorkspaceOrchestrator {
                             .apply_visual_action(&VisualAction::ShowFloatingPanes { tab_id })
                             .await;
                     }
-                    ("input_required", title)
+                    ("input_required", None, title)
                 } else {
                     if rec.lifecycle.is_active() {
                         rec.lifecycle = EntityLifecycle::Repl(ReplLifecycle::Idle { started_at });
                     }
-                    (rec.lifecycle.status_label(), rec.pane_title.clone())
+                    (
+                        rec.lifecycle.status_label(),
+                        rec.lifecycle.exit_code(),
+                        rec.pane_title.clone(),
+                    )
                 }
             } else {
-                ("stopped", PaneTitleCodec::format("[STOP]", &key, None))
+                (
+                    "stopped",
+                    None,
+                    PaneTitleCodec::format("[STOP]", &key, None),
+                )
             }
         };
 
-        let alerts = self.inner.state.write().await.drain_alerts();
+        let (tab_name, alerts) = {
+            let mut store = self.inner.state.write().await;
+            (store.tab_name_for(tab_id), store.drain_alerts())
+        };
         Ok((
             ReplExecOutcome {
                 name: req.name,
                 pane_id,
                 pane_title,
+                tab_id,
+                tab_name,
+                placement,
+                layout_hint: None,
                 status,
+                exit_code,
                 delta_output,
                 timed_out,
             },
@@ -1761,6 +2154,7 @@ impl WorkspaceOrchestrator {
                         let lines: Vec<String> = raw.lines().map(ToOwned::to_owned).collect();
                         self.inject_viewport_frame(SubscribeFrame {
                             pane_id,
+                            is_initial: false,
                             viewport_lines: lines,
                         })
                         .await;
@@ -1828,6 +2222,7 @@ impl WorkspaceOrchestrator {
                     started_at,
                     ended_at: SystemTime::now(),
                     exit_code: observed_exit_code,
+                    pane_closed: true,
                 });
             }
         }

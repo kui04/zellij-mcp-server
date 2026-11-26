@@ -9,6 +9,9 @@ use rmcp::ServiceExt;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use zellij_mcp_server::domain::ids::SessionResolution;
+use zellij_mcp_server::domain::layout::{
+    DEFAULT_MIN_PANE_COLS, DEFAULT_MIN_PANE_ROWS, LayoutConstraints,
+};
 use zellij_mcp_server::mcp::server::ZellijMcpServer;
 use zellij_mcp_server::runtime::{OrchestratorConfig, WorkspaceOrchestrator};
 use zellij_mcp_server::zellij::cli::ZellijClient;
@@ -32,6 +35,14 @@ struct Cli {
     /// Keep a server-created Zellij session alive when the MCP server exits.
     #[arg(long, default_value_t = false)]
     keep_session: bool,
+
+    /// Hard minimum column width preserved per pane when splitting horizontally (0 disables).
+    #[arg(long, env = "ZELLIJ_MCP_MIN_PANE_COLS", default_value_t = DEFAULT_MIN_PANE_COLS)]
+    min_pane_cols: u16,
+
+    /// Hard minimum row height preserved per pane when splitting vertically (0 disables).
+    #[arg(long, env = "ZELLIJ_MCP_MIN_PANE_ROWS", default_value_t = DEFAULT_MIN_PANE_ROWS)]
+    min_pane_rows: u16,
 }
 
 #[tokio::main]
@@ -77,6 +88,10 @@ async fn main() -> Result<()> {
             confirm_destructive: cli.confirm_destructive,
             keep_session: cli.keep_session,
             default_cwd,
+            layout_constraints: LayoutConstraints {
+                min_pane_cols: cli.min_pane_cols,
+                min_pane_rows: cli.min_pane_rows,
+            },
         },
         client,
     );

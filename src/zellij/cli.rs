@@ -720,6 +720,7 @@ pub mod mock {
         session_alive: bool,
         session_preexisting: bool,
         fail_stacked: bool,
+        fail_no_room: bool,
         recorded_actions: Vec<String>,
     }
 
@@ -731,6 +732,19 @@ pub mod mock {
                 active: true,
                 viewport: ViewportSnapshot::new(200, 50, 1),
             };
+            let initial_pane = ObservedPane {
+                pane_id: TerminalPaneId::new(0),
+                tab_id: TabId::new(0),
+                title: "Pane #1".to_owned(),
+                is_focused: true,
+                is_floating: false,
+                columns: 200,
+                rows: 50,
+                exited: false,
+                exit_status: None,
+                cwd: None,
+                command: None,
+            };
             Self {
                 inner: Arc::new(MockZellijInner {
                     session,
@@ -738,12 +752,13 @@ pub mod mock {
                         next_tab_id: 1,
                         next_pane_id: 1,
                         tabs: vec![initial_tab],
-                        panes: Vec::new(),
+                        panes: vec![initial_pane],
                         screen_dumps: HashMap::new(),
                         confirm_answer: true,
                         session_alive: true,
                         session_preexisting: false,
                         fail_stacked: false,
+                        fail_no_room: false,
                         recorded_actions: Vec::new(),
                     }),
                 }),
@@ -785,6 +800,18 @@ pub mod mock {
             self.lock_state().fail_stacked = fail;
         }
 
+        pub fn set_fail_no_room(&self, fail: bool) {
+            self.lock_state().fail_no_room = fail;
+        }
+
+        pub fn set_focused_pane_geometry(&self, columns: u16, rows: u16) {
+            let mut state = self.lock_state();
+            if let Some(pane) = state.panes.iter_mut().find(|p| p.is_focused) {
+                pane.columns = columns;
+                pane.rows = rows;
+            }
+        }
+
         pub(crate) fn ensure_alive(&self) -> Result<()> {
             if !self.lock_state().session_alive {
                 return Err(DomainError::SessionNotFound(self.inner.session.clone()).into());
@@ -806,6 +833,10 @@ pub mod mock {
             let mut state = self.lock_state();
             if let Some(tab) = state.tabs.first_mut() {
                 tab.viewport = ViewportSnapshot::new(columns, rows, tiled_panes);
+            }
+            if let Some(pane) = state.panes.iter_mut().find(|p| p.is_focused) {
+                pane.columns = columns;
+                pane.rows = rows;
             }
         }
 
@@ -856,14 +887,50 @@ pub mod mock {
                     "zellij [\"action\", \"new-pane\", \"--stacked\"] exited with exit status: 2: stderr=A connected client or a target pane is required, stdout="
                 );
             }
+            if state.fail_no_room
+                && matches!(
+                    spec.placement,
+                    ResolvedPlacement::SplitRight | ResolvedPlacement::SplitDown
+                )
+            {
+                bail!(
+                    "zellij [\"action\", \"new-pane\", \"--direction\", \"right\"] exited with exit status: 2: stderr=No room for a new pane, stdout="
+                );
+            }
             let pane_id = TerminalPaneId::new(state.next_pane_id);
             state.next_pane_id += 1;
             let tab_id = spec.tab_id.unwrap_or(TabId::new(0));
+            if matches!(
+                spec.placement,
+                ResolvedPlacement::SplitRight | ResolvedPlacement::SplitDown
+            ) {
+                if let Some(focused) = state
+                    .panes
+                    .iter_mut()
+                    .find(|p| p.tab_id == tab_id && p.is_focused && !p.is_floating)
+                {
+                    match spec.placement {
+                        ResolvedPlacement::SplitRight => focused.columns /= 2,
+                        ResolvedPlacement::SplitDown => focused.rows /= 2,
+                        _ => {}
+                    }
+                }
+                if let Some(tab) = state.tabs.iter_mut().find(|t| t.tab_id == tab_id) {
+                    tab.viewport = ViewportSnapshot::new(
+                        tab.viewport.columns,
+                        tab.viewport.rows,
+                        tab.viewport.tiled_panes_in_active_tab.saturating_add(1),
+                    );
+                }
+            }
             state.panes.push(ObservedPane {
                 pane_id,
                 tab_id,
                 title: spec.name.clone(),
+                is_focused: false,
                 is_floating: spec.placement == ResolvedPlacement::Floating,
+                columns: 80,
+                rows: 24,
                 exited: false,
                 exit_status: None,
                 cwd: spec.cwd.clone(),

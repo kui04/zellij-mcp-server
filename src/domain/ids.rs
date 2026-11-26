@@ -477,17 +477,25 @@ impl CompiledPattern {
         self.regex.is_match(text)
     }
 
-    /// Matches a terminal screen line, tolerating Zellij's stripping of trailing spaces on prompt
-    /// lines (e.g. `">>> "` dumped as `">>>"`).
+    /// Matches a waiting terminal prompt line, tolerating Zellij's stripping of trailing spaces
+    /// (e.g. `">>> "` dumped as `">>>"`) while rejecting echoed command lines that carry
+    /// non-whitespace text after the prompt (e.g. `">>> print('AAA')"`).
     pub fn matches_terminal_line(&self, line: &str) -> bool {
-        if self.regex.is_match(line) {
+        if self
+            .regex
+            .find_iter(line)
+            .any(|m| line[m.end()..].trim().is_empty())
+        {
             return true;
         }
         if !line.ends_with(' ') {
             let mut with_space = String::with_capacity(line.len() + 1);
             with_space.push_str(line);
             with_space.push(' ');
-            return self.regex.is_match(&with_space);
+            return self
+                .regex
+                .find_iter(&with_space)
+                .any(|m| with_space[m.end()..].trim().is_empty());
         }
         false
     }
@@ -528,17 +536,156 @@ impl LogSeq {
 pub struct KeyChord(String);
 
 impl KeyChord {
+    /// Parses and normalizes a key chord into Zellij `send-keys` syntax (e.g. `"Ctrl+C"` and
+    /// `"C-c"` normalize to `"Ctrl c"`, `"Alt+Enter"` normalizes to `"Alt Enter"`).
     pub fn parse(raw: impl Into<String>) -> Result<Self, ParseError> {
         let trimmed = raw.into().trim().to_owned();
         if trimmed.is_empty() {
             return Err(ParseError::Empty { field: "keys" });
         }
-        Ok(Self(trimmed))
+        let normalized = normalize_key_chord(&trimmed);
+        if normalized.is_empty() {
+            return Err(ParseError::Empty { field: "keys" });
+        }
+        Ok(Self(normalized))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+fn normalize_modifier(token: &str) -> Option<&'static str> {
+    // Preserve Emacs case convention for single-letter `S` (Shift) vs `s` (Super).
+    if token == "S" {
+        return Some("Shift");
+    }
+    if token == "s" {
+        return Some("Super");
+    }
+    match token.to_ascii_lowercase().as_str() {
+        "ctrl" | "control" | "c" => Some("Ctrl"),
+        "alt" | "meta" | "opt" | "option" | "m" => Some("Alt"),
+        "shift" => Some("Shift"),
+        "super" | "cmd" | "command" | "win" => Some("Super"),
+        _ => None,
+    }
+}
+
+fn normalize_named_key(token: &str) -> Option<&'static str> {
+    match token.to_ascii_lowercase().as_str() {
+        "enter" | "return" | "cr" => Some("Enter"),
+        "esc" | "escape" => Some("Esc"),
+        "tab" => Some("Tab"),
+        "backspace" | "bs" => Some("Backspace"),
+        "space" => Some("Space"),
+        "del" | "delete" => Some("Delete"),
+        "ins" | "insert" => Some("Insert"),
+        "home" => Some("Home"),
+        "end" => Some("End"),
+        "pageup" | "pgup" | "page up" | "page_up" => Some("PageUp"),
+        "pagedown" | "pgdn" | "page down" | "page_down" => Some("PageDown"),
+        "up" => Some("Up"),
+        "down" => Some("Down"),
+        "left" => Some("Left"),
+        "right" => Some("Right"),
+        _ => None,
+    }
+}
+
+fn split_delimited_chord(raw: &str, delim: char) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut rest = raw;
+    let delim_str = delim.to_string();
+    while let Some(idx) = rest.find(delim) {
+        let head = &rest[..idx];
+        if !head.is_empty() {
+            parts.push(head.to_owned());
+        }
+        rest = &rest[idx + 1..];
+        if rest == delim_str {
+            parts.push(delim_str.clone());
+            rest = "";
+            break;
+        }
+    }
+    if !rest.is_empty() {
+        parts.push(rest.to_owned());
+    }
+    parts
+}
+
+fn normalize_key_chord(raw: &str) -> String {
+    if raw == "+" || raw == "-" {
+        return raw.to_owned();
+    }
+
+    if let Some(named) = normalize_named_key(raw) {
+        return named.to_owned();
+    }
+
+    let tokens: Vec<String> = if raw.contains('+') && !raw.contains(char::is_whitespace) {
+        split_delimited_chord(raw, '+')
+    } else if !raw.contains(char::is_whitespace)
+        && raw.contains('-')
+        && raw
+            .split('-')
+            .next()
+            .is_some_and(|first| normalize_modifier(first).is_some())
+    {
+        split_delimited_chord(raw, '-')
+    } else {
+        raw.split_whitespace().map(ToOwned::to_owned).collect()
+    };
+
+    if tokens.is_empty() {
+        return String::new();
+    }
+
+    if tokens.len() == 1 {
+        let tok = &tokens[0];
+        return normalize_named_key(tok)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| tok.clone());
+    }
+
+    // Merge trailing two-word named keys such as `"Ctrl page up"` -> `["Ctrl", "PageUp"]`.
+    let mut tokens = tokens;
+    if tokens.len() >= 2 {
+        let tail_pair = format!("{} {}", tokens[tokens.len() - 2], tokens[tokens.len() - 1]);
+        if let Some(named) = normalize_named_key(&tail_pair) {
+            let new_len = tokens.len() - 2;
+            tokens.truncate(new_len);
+            tokens.push(named.to_owned());
+            if tokens.len() == 1 {
+                return tokens.into_iter().next().unwrap_or_default();
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut has_shift = false;
+    for modifier in &tokens[..tokens.len() - 1] {
+        if let Some(norm) = normalize_modifier(modifier) {
+            if norm == "Shift" {
+                has_shift = true;
+            }
+            out.push(norm.to_owned());
+        } else {
+            out.push(modifier.clone());
+        }
+    }
+
+    let last = &tokens[tokens.len() - 1];
+    let normalized_last = if let Some(named) = normalize_named_key(last) {
+        named.to_owned()
+    } else if last.len() == 1 && last.as_bytes()[0].is_ascii_uppercase() && !has_shift {
+        last.to_ascii_lowercase()
+    } else {
+        last.clone()
+    };
+    out.push(normalized_last);
+    out.join(" ")
 }
 
 impl TryFrom<String> for KeyChord {

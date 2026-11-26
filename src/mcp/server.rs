@@ -99,6 +99,15 @@ fn map_alerts(alerts: Vec<WorkspaceAlert>) -> Vec<WorkspaceAlertDto> {
     alerts.into_iter().map(WorkspaceAlertDto::from).collect()
 }
 
+fn combine_hints(layout_hint: Option<String>, primary: Option<String>) -> Option<String> {
+    match (layout_hint, primary) {
+        (Some(a), Some(b)) => Some(format!("{a} {b}")),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 #[tool_router]
 impl ZellijMcpServer {
     #[tool(
@@ -134,11 +143,13 @@ impl ZellijMcpServer {
         let session = snapshot.session_resolution.session_name().to_string();
         let attach_command = format!("zellij attach {session}");
 
+        let estimated_col_if_split = snapshot.layout.estimated_col_if_split();
         let viewport = snapshot.layout.viewport.map(|v| ViewportDto {
             columns: v.columns,
             rows: v.rows,
             tiled_panes_in_current_tab: v.tiled_panes_in_active_tab,
-            estimated_col_if_split: v.estimated_col_if_split(),
+            estimated_col_if_split: estimated_col_if_split
+                .unwrap_or_else(|| v.estimated_col_if_split()),
             layout_tier: v.tier.as_str().to_owned(),
         });
 
@@ -167,6 +178,7 @@ impl ZellijMcpServer {
                     tab_id: rec.tab_id.get(),
                     placement: rec.placement.as_str().to_owned(),
                     status: rec.lifecycle.status_label().to_owned(),
+                    pane_closed: rec.lifecycle.is_pane_closed(),
                     exit_code: rec.lifecycle.exit_code(),
                 }
             })
@@ -213,12 +225,16 @@ impl ZellijMcpServer {
                 task_id,
                 pane_id,
                 pane_title,
+                tab_id,
+                tab_name,
+                placement,
+                layout_hint,
                 status,
                 exit_code,
                 elapsed_ms,
                 output,
             } => {
-                let hint = if status == "failed" {
+                let primary_hint = if status == "failed" {
                     Some(hint_task_failed(&pane_title))
                 } else {
                     None
@@ -227,34 +243,44 @@ impl ZellijMcpServer {
                     task_id: task_id.to_string(),
                     pane_id: pane_id.to_string(),
                     pane_name: pane_title,
+                    tab_id: tab_id.get(),
+                    tab_name,
+                    placement: placement.as_str().to_owned(),
                     status: status.to_owned(),
                     elapsed_ms,
                     exit_code,
                     output: Some(output),
                     tail_preview: None,
                     alerts: map_alerts(alerts),
-                    hint,
+                    hint: combine_hints(layout_hint, primary_hint),
                 }
             }
             TaskRunOutcome::Running {
                 task_id,
                 pane_id,
                 pane_title,
+                tab_id,
+                tab_name,
+                placement,
+                layout_hint,
                 elapsed_ms,
                 tail_preview,
             } => {
-                let hint = hint_task_running(&task_id);
+                let primary_hint = Some(hint_task_running(&task_id));
                 TaskRunResponse {
                     task_id: task_id.to_string(),
                     pane_id: pane_id.to_string(),
                     pane_name: pane_title,
+                    tab_id: tab_id.get(),
+                    tab_name,
+                    placement: placement.as_str().to_owned(),
                     status: "running".to_owned(),
                     elapsed_ms,
                     exit_code: None,
                     output: None,
                     tail_preview: Some(tail_preview),
                     alerts: map_alerts(alerts),
-                    hint: Some(hint),
+                    hint: combine_hints(layout_hint, primary_hint),
                 }
             }
         };
@@ -420,7 +446,7 @@ impl ZellijMcpServer {
             .await
             .map_err(map_runtime_err)?;
 
-        let hint = if outcome.reused {
+        let primary_hint = if outcome.reused {
             Some(hint_service_reused(&name))
         } else if outcome.status == "starting" {
             Some(format!(
@@ -434,12 +460,15 @@ impl ZellijMcpServer {
             name: outcome.name.to_string(),
             pane_id: outcome.pane_id.to_string(),
             pane_name: outcome.pane_title,
+            tab_id: outcome.tab_id.get(),
+            tab_name: outcome.tab_name,
+            placement: outcome.placement.as_str().to_owned(),
             reused: outcome.reused,
             status: outcome.status.to_owned(),
             matched_line: outcome.matched_line,
             tail_preview: outcome.tail_preview,
             alerts: map_alerts(alerts),
-            hint,
+            hint: combine_hints(outcome.layout_hint, primary_hint),
         }))
     }
 
@@ -501,12 +530,15 @@ impl ZellijMcpServer {
             name: outcome.name.to_string(),
             pane_id: outcome.pane_id.to_string(),
             pane_name: outcome.pane_title,
+            tab_id: outcome.tab_id.get(),
+            tab_name: outcome.tab_name,
+            placement: outcome.placement.as_str().to_owned(),
             reused: outcome.reused,
             status: outcome.status.to_owned(),
             matched_line: outcome.matched_line,
             tail_preview: outcome.tail_preview,
             alerts: map_alerts(alerts),
-            hint: None,
+            hint: outcome.layout_hint,
         }))
     }
 
@@ -569,15 +601,28 @@ impl ZellijMcpServer {
             .await
             .map_err(map_runtime_err)?;
 
+        let primary_hint = if outcome.status != "ready" {
+            Some(format!(
+                "REPL '{}' exited immediately (exit_code={:?}). Verify the command is available in the Zellij server PATH.",
+                outcome.name, outcome.exit_code
+            ))
+        } else {
+            None
+        };
+
         Ok(Json(ReplResponse {
             name: outcome.name.to_string(),
             pane_id: outcome.pane_id.to_string(),
             pane_name: outcome.pane_title,
+            tab_id: outcome.tab_id.get(),
+            tab_name: outcome.tab_name,
+            placement: outcome.placement.as_str().to_owned(),
             status: outcome.status.to_owned(),
+            exit_code: outcome.exit_code,
             output: outcome.delta_output,
             timed_out: outcome.timed_out,
             alerts: map_alerts(alerts),
-            hint: None,
+            hint: combine_hints(outcome.layout_hint, primary_hint),
         }))
     }
 
@@ -622,7 +667,11 @@ impl ZellijMcpServer {
             name: outcome.name.to_string(),
             pane_id: outcome.pane_id.to_string(),
             pane_name: outcome.pane_title,
+            tab_id: outcome.tab_id.get(),
+            tab_name: outcome.tab_name,
+            placement: outcome.placement.as_str().to_owned(),
             status: outcome.status.to_owned(),
+            exit_code: outcome.exit_code,
             output: outcome.delta_output,
             timed_out: outcome.timed_out,
             alerts: map_alerts(alerts),
@@ -661,5 +710,27 @@ impl ServerHandler for ZellijMcpServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(SERVER_INSTRUCTIONS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::combine_hints;
+
+    #[test]
+    fn combine_hints_preserves_layout_hint_before_operational_hint() {
+        assert_eq!(combine_hints(None, None), None);
+        assert_eq!(
+            combine_hints(Some("layout".into()), None).as_deref(),
+            Some("layout")
+        );
+        assert_eq!(
+            combine_hints(None, Some("op".into())).as_deref(),
+            Some("op")
+        );
+        assert_eq!(
+            combine_hints(Some("layout".into()), Some("op".into())).as_deref(),
+            Some("layout op")
+        );
     }
 }

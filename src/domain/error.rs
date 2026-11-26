@@ -1,5 +1,7 @@
 //! Typed domain and boundary-parsing errors.
 
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 use crate::domain::ids::{ManagedKey, ReplName, ServiceName, SessionName, TaskId};
@@ -70,4 +72,7 @@ pub enum DomainError {
 
     #[error("destructive action was cancelled by the human user")]
     UserDeniedConfirmation,
+
+    #[error("invalid working directory '{}': {reason}", path.display())]
+    InvalidCwd { path: PathBuf, reason: String },
 }

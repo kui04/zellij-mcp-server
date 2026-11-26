@@ -27,6 +27,7 @@ pub enum TaskLifecycle {
         ended_at: SystemTime,
         exit_code: NonZeroI32,
         attention_marked: bool,
+        pane_closed: bool,
     },
     Cancelled {
         started_at: SystemTime,
@@ -79,6 +80,26 @@ impl TaskLifecycle {
             | Self::StoppedByUser { started_at, .. } => *started_at,
         }
     }
+
+    pub const fn is_pane_closed(&self) -> bool {
+        match self {
+            Self::Running { .. } => false,
+            Self::Completed { pane_closed, .. }
+            | Self::Failed { pane_closed, .. }
+            | Self::Cancelled { pane_closed, .. } => *pane_closed,
+            Self::StoppedByUser { .. } => true,
+        }
+    }
+
+    pub const fn ended_at(&self) -> Option<SystemTime> {
+        match self {
+            Self::Running { .. } => None,
+            Self::Completed { ended_at, .. }
+            | Self::Failed { ended_at, .. }
+            | Self::Cancelled { ended_at, .. }
+            | Self::StoppedByUser { ended_at, .. } => Some(*ended_at),
+        }
+    }
 }
 
 /// Lifecycle states legal for a long-lived `Service`.
@@ -101,10 +122,12 @@ pub enum ServiceLifecycle {
         ended_at: SystemTime,
         exit_code: Option<i32>,
         attention_marked: bool,
+        pane_closed: bool,
     },
     Stopped {
         started_at: SystemTime,
         ended_at: SystemTime,
+        pane_closed: bool,
     },
     StoppedByUser {
         started_at: SystemTime,
@@ -156,6 +179,23 @@ impl ServiceLifecycle {
             | Self::StoppedByUser { started_at, .. } => *started_at,
         }
     }
+
+    pub const fn is_pane_closed(&self) -> bool {
+        match self {
+            Self::Starting { .. } | Self::Ready { .. } | Self::Stopping { .. } => false,
+            Self::Failed { pane_closed, .. } | Self::Stopped { pane_closed, .. } => *pane_closed,
+            Self::StoppedByUser { .. } => true,
+        }
+    }
+
+    pub const fn ended_at(&self) -> Option<SystemTime> {
+        match self {
+            Self::Starting { .. } | Self::Ready { .. } | Self::Stopping { .. } => None,
+            Self::Failed { ended_at, .. }
+            | Self::Stopped { ended_at, .. }
+            | Self::StoppedByUser { ended_at, .. } => Some(*ended_at),
+        }
+    }
 }
 
 /// Lifecycle states legal for a stateful interactive `REPL`.
@@ -180,6 +220,7 @@ pub enum ReplLifecycle {
         started_at: SystemTime,
         ended_at: SystemTime,
         exit_code: Option<i32>,
+        pane_closed: bool,
     },
     StoppedByUser {
         started_at: SystemTime,
@@ -228,6 +269,27 @@ impl ReplLifecycle {
             | Self::InputRequired { started_at, .. }
             | Self::Exited { started_at, .. }
             | Self::StoppedByUser { started_at, .. } => *started_at,
+        }
+    }
+
+    pub const fn is_pane_closed(&self) -> bool {
+        match self {
+            Self::Starting { .. }
+            | Self::Idle { .. }
+            | Self::Busy { .. }
+            | Self::InputRequired { .. } => false,
+            Self::Exited { pane_closed, .. } => *pane_closed,
+            Self::StoppedByUser { .. } => true,
+        }
+    }
+
+    pub const fn ended_at(&self) -> Option<SystemTime> {
+        match self {
+            Self::Starting { .. }
+            | Self::Idle { .. }
+            | Self::Busy { .. }
+            | Self::InputRequired { .. } => None,
+            Self::Exited { ended_at, .. } | Self::StoppedByUser { ended_at, .. } => Some(*ended_at),
         }
     }
 }
@@ -299,6 +361,22 @@ impl EntityLifecycle {
             Self::Task(t) => t.started_at(),
             Self::Service(s) => s.started_at(),
             Self::Repl(r) => r.started_at(),
+        }
+    }
+
+    pub const fn is_pane_closed(&self) -> bool {
+        match self {
+            Self::Task(t) => t.is_pane_closed(),
+            Self::Service(s) => s.is_pane_closed(),
+            Self::Repl(r) => r.is_pane_closed(),
+        }
+    }
+
+    pub const fn ended_at(&self) -> Option<SystemTime> {
+        match self {
+            Self::Task(t) => t.ended_at(),
+            Self::Service(s) => s.ended_at(),
+            Self::Repl(r) => r.ended_at(),
         }
     }
 }

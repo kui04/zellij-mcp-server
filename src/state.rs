@@ -10,8 +10,8 @@ use crate::domain::ids::{
     TabId, TaskId, TerminalPaneId,
 };
 use crate::domain::layout::{
-    LayoutState, MANAGED_SERVICES_TAB_NAME, MANAGED_TASKS_TAB_NAME, ResolvedPlacement,
-    ViewportSnapshot,
+    FocusedPaneGeometry, LayoutState, MANAGED_SERVICES_TAB_NAME, MANAGED_TASKS_TAB_NAME,
+    ResolvedPlacement, ViewportSnapshot,
 };
 use crate::domain::lifecycle::{
     ERROR_PANE_BG_HEX, ERROR_PANE_BORDER_STYLE, EntityLifecycle, ReplLifecycle, ServiceLifecycle,
@@ -21,6 +21,8 @@ use crate::logs::{BoundedLogBuffer, diff_viewport, strip_ansi};
 
 /// Number of recently completed task panes kept open before automatic GC.
 pub const MAX_RETAINED_COMPLETED_TASKS: usize = 5;
+/// Maximum number of closed terminal records retained in memory for historical inspection.
+pub const MAX_RETAINED_CLOSED_RECORDS: usize = 50;
 /// Maximum number of buffered early exit/close events for panes not yet registered.
 const MAX_EARLY_EVENT_BUFFER: usize = 64;
 
@@ -54,6 +56,7 @@ pub struct TransitionEffects {
     pub visual_actions: Vec<VisualAction>,
     pub alerts: Vec<WorkspaceAlert>,
     pub changed_keys: Vec<ManagedKey>,
+    pub exited_panes: Vec<TerminalPaneId>,
     pub closed_panes: Vec<TerminalPaneId>,
     pub subscription_dirty: bool,
 }
@@ -63,6 +66,7 @@ impl TransitionEffects {
         self.visual_actions.extend(other.visual_actions);
         self.alerts.extend(other.alerts);
         self.changed_keys.extend(other.changed_keys);
+        self.exited_panes.extend(other.exited_panes);
         self.closed_panes.extend(other.closed_panes);
         self.subscription_dirty |= other.subscription_dirty;
     }
@@ -91,7 +95,10 @@ pub struct ObservedPane {
     pub pane_id: TerminalPaneId,
     pub tab_id: TabId,
     pub title: String,
+    pub is_focused: bool,
     pub is_floating: bool,
+    pub columns: u16,
+    pub rows: u16,
     pub exited: bool,
     pub exit_status: Option<i32>,
     pub cwd: Option<PathBuf>,
@@ -262,6 +269,7 @@ impl StateStore {
                                     .visual_actions
                                     .push(VisualAction::RenamePane { pane_id, title });
                                 effects.changed_keys.push(key);
+                                effects.exited_panes.push(pane_id);
                                 effects.subscription_dirty = true;
                                 for gc_pane in self.select_and_mark_completed_tasks_for_gc(
                                     MAX_RETAINED_COMPLETED_TASKS,
@@ -279,6 +287,7 @@ impl StateStore {
                                     ended_at: now,
                                     exit_code: code,
                                     attention_marked: false,
+                                    pane_closed: false,
                                 });
                                 let title = format_record_title(record);
                                 record.pane_title = title.clone();
@@ -295,6 +304,7 @@ impl StateStore {
                                     message: format!("Task failed ({code}): {title}"),
                                 });
                                 effects.changed_keys.push(key);
+                                effects.exited_panes.push(pane_id);
                                 effects.subscription_dirty = true;
                             }
                         }
@@ -315,6 +325,7 @@ impl StateStore {
                             ended_at: now,
                             exit_code,
                             attention_marked: true,
+                            pane_closed: false,
                         });
                         let title = format_record_title(record);
                         record.pane_title = title.clone();
@@ -343,6 +354,7 @@ impl StateStore {
                         self.pending_alerts.push(alert.clone());
                         effects.alerts.push(alert);
                         effects.changed_keys.push(key);
+                        effects.exited_panes.push(pane_id);
                         effects.subscription_dirty = true;
                     }
                     EntityLifecycle::Service(ServiceLifecycle::Stopping { started_at }) => {
@@ -350,6 +362,7 @@ impl StateStore {
                         record.lifecycle = EntityLifecycle::Service(ServiceLifecycle::Stopped {
                             started_at,
                             ended_at: now,
+                            pane_closed: false,
                         });
                         let title = format_record_title(record);
                         record.pane_title = title.clone();
@@ -357,6 +370,7 @@ impl StateStore {
                             .visual_actions
                             .push(VisualAction::RenamePane { pane_id, title });
                         effects.changed_keys.push(key);
+                        effects.exited_panes.push(pane_id);
                         effects.subscription_dirty = true;
                     }
                     EntityLifecycle::Service(
@@ -375,6 +389,7 @@ impl StateStore {
                             started_at,
                             ended_at: now,
                             exit_code,
+                            pane_closed: false,
                         });
                         let title = format_record_title(record);
                         record.pane_title = title.clone();
@@ -382,6 +397,7 @@ impl StateStore {
                             .visual_actions
                             .push(VisualAction::RenamePane { pane_id, title });
                         effects.changed_keys.push(key);
+                        effects.exited_panes.push(pane_id);
                         effects.subscription_dirty = true;
                     }
                     EntityLifecycle::Repl(
@@ -401,13 +417,7 @@ impl StateStore {
                 let Some(record) = self.panes_by_key.get_mut(&key) else {
                     return effects;
                 };
-                if let EntityLifecycle::Task(
-                    TaskLifecycle::Completed { pane_closed, .. }
-                    | TaskLifecycle::Cancelled { pane_closed, .. },
-                ) = &mut record.lifecycle
-                {
-                    *pane_closed = true;
-                }
+                mark_lifecycle_pane_closed(&mut record.lifecycle);
                 if record.lifecycle.is_active() {
                     record.lifecycle = match &record.lifecycle {
                         EntityLifecycle::Task(t) => {
@@ -420,6 +430,7 @@ impl StateStore {
                             EntityLifecycle::Service(ServiceLifecycle::Stopped {
                                 started_at: *started_at,
                                 ended_at: now,
+                                pane_closed: true,
                             })
                         }
                         EntityLifecycle::Service(s) => {
@@ -438,6 +449,7 @@ impl StateStore {
                     effects.changed_keys.push(key);
                     effects.subscription_dirty = true;
                 }
+                self.prune_closed_history(MAX_RETAINED_CLOSED_RECORDS);
             }
             ZellijEvent::TabFocused { tab_id } => {
                 self.layout.active_tab_id = Some(tab_id);
@@ -461,9 +473,14 @@ impl StateStore {
 
     /// Applies a viewport frame from `zellij subscribe`, appending diffed lines, checking
     /// service readiness, and recovering REPLs from `InputRequired` once new output resumes.
+    ///
+    /// When `is_initial` is true on a pane that already has a baseline (`!last_viewport.is_empty()`),
+    /// the frame came from a `zellij subscribe` mux restart; reset the viewport baseline without
+    /// replaying historical lines into `logs`.
     pub fn apply_viewport_frame(
         &mut self,
         pane_id: TerminalPaneId,
+        is_initial: bool,
         viewport_lines: Vec<String>,
         now: SystemTime,
     ) -> TransitionEffects {
@@ -476,6 +493,10 @@ impl StateStore {
         };
 
         let cleaned: Vec<String> = viewport_lines.iter().map(|l| strip_ansi(l)).collect();
+        if is_initial && !record.last_viewport.is_empty() {
+            record.last_viewport = cleaned;
+            return effects;
+        }
         let delta = diff_viewport(&record.last_viewport, &cleaned);
         record.last_viewport = cleaned;
 
@@ -583,7 +604,9 @@ impl StateStore {
 
         if let Some(tab) = effective_active {
             self.layout.active_tab_id = Some(tab.tab_id);
+            self.layout.active_tab_name = Some(tab.name.clone());
             self.layout.viewport = Some(tab.viewport);
+            self.layout.focused_pane = find_focused_pane_geometry(tab.tab_id, &snapshot.panes);
         }
 
         let live_pane_ids: HashSet<TerminalPaneId> =
@@ -592,11 +615,7 @@ impl StateStore {
         // Mark previously tracked panes that disappeared as closed / StoppedByUser.
         for record in self.panes_by_key.values_mut() {
             if !live_pane_ids.contains(&record.pane_id) {
-                if let EntityLifecycle::Task(TaskLifecycle::Completed { pane_closed, .. }) =
-                    &mut record.lifecycle
-                {
-                    *pane_closed = true;
-                }
+                mark_lifecycle_pane_closed(&mut record.lifecycle);
                 if record.lifecycle.is_active() {
                     effects.closed_panes.push(record.pane_id);
                     effects.subscription_dirty = true;
@@ -685,6 +704,7 @@ impl StateStore {
                                 ended_at: now,
                                 exit_code: other.unwrap_or(FALLBACK_NONZERO_EXIT),
                                 attention_marked: false,
+                                pane_closed: false,
                             }),
                         }
                     } else {
@@ -698,6 +718,7 @@ impl StateStore {
                             ended_at: now,
                             exit_code: pane.exit_status,
                             attention_marked: false,
+                            pane_closed: false,
                         })
                     } else {
                         EntityLifecycle::Service(ServiceLifecycle::Ready {
@@ -713,6 +734,7 @@ impl StateStore {
                             started_at: now,
                             ended_at: now,
                             exit_code: pane.exit_status,
+                            pane_closed: false,
                         })
                     } else {
                         EntityLifecycle::Repl(ReplLifecycle::Idle { started_at: now })
@@ -737,7 +759,75 @@ impl StateStore {
             }));
         }
 
+        self.prune_closed_history(MAX_RETAINED_CLOSED_RECORDS);
         effects
+    }
+
+    /// Lightweight refresh of active tab viewport and focused pane geometry prior to placement.
+    pub fn update_layout_snapshot(
+        &mut self,
+        tabs: &[ObservedTab],
+        active_tab: Option<&ObservedTab>,
+        panes: &[ObservedPane],
+    ) {
+        self.layout.managed_tabs.tasks = tabs
+            .iter()
+            .find(|t| t.name == MANAGED_TASKS_TAB_NAME)
+            .map(|t| t.tab_id);
+        self.layout.managed_tabs.services = tabs
+            .iter()
+            .find(|t| t.name == MANAGED_SERVICES_TAB_NAME)
+            .map(|t| t.tab_id);
+
+        let effective_active = active_tab
+            .or_else(|| tabs.iter().find(|t| t.active))
+            .or_else(|| tabs.first());
+        if let Some(tab) = effective_active {
+            self.layout.active_tab_id = Some(tab.tab_id);
+            self.layout.active_tab_name = Some(tab.name.clone());
+            self.layout.viewport = Some(tab.viewport);
+            self.layout.focused_pane = find_focused_pane_geometry(tab.tab_id, panes);
+        }
+    }
+
+    /// Resolves a human-readable tab name for a known managed or active tab ID.
+    pub fn tab_name_for(&self, tab_id: TabId) -> Option<String> {
+        if self.layout.managed_tabs.tasks == Some(tab_id) {
+            Some(MANAGED_TASKS_TAB_NAME.to_owned())
+        } else if self.layout.managed_tabs.services == Some(tab_id) {
+            Some(MANAGED_SERVICES_TAB_NAME.to_owned())
+        } else if self.layout.active_tab_id == Some(tab_id) {
+            self.layout.active_tab_name.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Evicts oldest closed terminal records beyond `max_closed` to bound `workspace_status` size.
+    pub fn prune_closed_history(&mut self, max_closed: usize) {
+        let mut closed: Vec<(SystemTime, ManagedKey, TerminalPaneId)> = self
+            .panes_by_key
+            .values()
+            .filter(|rec| !rec.lifecycle.is_active() && rec.lifecycle.is_pane_closed())
+            .map(|rec| {
+                let ts = rec
+                    .lifecycle
+                    .ended_at()
+                    .unwrap_or_else(|| rec.lifecycle.started_at());
+                (ts, rec.key.clone(), rec.pane_id)
+            })
+            .collect();
+
+        if closed.len() <= max_closed {
+            return;
+        }
+        closed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.2.cmp(&a.2)));
+        for (_, key, pane_id) in closed.into_iter().skip(max_closed) {
+            let _ = self.panes_by_key.remove(&key);
+            if self.key_by_pane_id.get(&pane_id) == Some(&key) {
+                let _ = self.key_by_pane_id.remove(&pane_id);
+            }
+        }
     }
 
     /// Selects oldest open `Completed` task panes exceeding `keep_recent` for GC; never selects
@@ -796,6 +886,58 @@ impl StateStore {
     pub fn drain_alerts(&mut self) -> Vec<WorkspaceAlert> {
         std::mem::take(&mut self.pending_alerts)
     }
+}
+
+fn mark_lifecycle_pane_closed(lifecycle: &mut EntityLifecycle) {
+    match lifecycle {
+        EntityLifecycle::Task(
+            TaskLifecycle::Completed { pane_closed, .. }
+            | TaskLifecycle::Failed { pane_closed, .. }
+            | TaskLifecycle::Cancelled { pane_closed, .. },
+        )
+        | EntityLifecycle::Service(
+            ServiceLifecycle::Failed { pane_closed, .. }
+            | ServiceLifecycle::Stopped { pane_closed, .. },
+        )
+        | EntityLifecycle::Repl(ReplLifecycle::Exited { pane_closed, .. }) => {
+            *pane_closed = true;
+        }
+        EntityLifecycle::Task(
+            TaskLifecycle::Running { .. } | TaskLifecycle::StoppedByUser { .. },
+        )
+        | EntityLifecycle::Service(
+            ServiceLifecycle::Starting { .. }
+            | ServiceLifecycle::Ready { .. }
+            | ServiceLifecycle::Stopping { .. }
+            | ServiceLifecycle::StoppedByUser { .. },
+        )
+        | EntityLifecycle::Repl(
+            ReplLifecycle::Starting { .. }
+            | ReplLifecycle::Idle { .. }
+            | ReplLifecycle::Busy { .. }
+            | ReplLifecycle::InputRequired { .. }
+            | ReplLifecycle::StoppedByUser { .. },
+        ) => {}
+    }
+}
+
+/// Returns the live dimensions of the focused tiled pane in `tab_id`, if any.
+///
+/// Returns `None` when focus is on a floating pane or when pane geometry is unavailable so
+/// `LayoutRouter` does not enforce split guards against an unrelated pane's dimensions.
+fn find_focused_pane_geometry(
+    tab_id: TabId,
+    panes: &[ObservedPane],
+) -> Option<FocusedPaneGeometry> {
+    panes
+        .iter()
+        .find(|p| {
+            p.tab_id == tab_id && !p.is_floating && p.is_focused && p.columns > 0 && p.rows > 0
+        })
+        .map(|p| FocusedPaneGeometry {
+            columns: p.columns,
+            rows: p.rows,
+        })
 }
 
 fn format_record_title(record: &ManagedRecord) -> String {
