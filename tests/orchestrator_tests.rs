@@ -27,12 +27,24 @@ fn make_orchestrator(
     WorkspaceOrchestrator,
     zellij_mcp_server::zellij::cli::mock::MockZellijCtrl,
 )> {
+    make_orchestrator_with_keep(session, confirm_destructive, false)
+}
+
+fn make_orchestrator_with_keep(
+    session: &str,
+    confirm_destructive: bool,
+    keep_session: bool,
+) -> Result<(
+    WorkspaceOrchestrator,
+    zellij_mcp_server::zellij::cli::mock::MockZellijCtrl,
+)> {
     let session_name = SessionName::parse(session)?;
     let (client, ctrl) = ZellijClient::new_mocked(session_name.clone());
     let orch = WorkspaceOrchestrator::new(
         OrchestratorConfig {
             session_resolution: SessionResolution::Explicit(session_name),
             confirm_destructive,
+            keep_session,
             default_cwd: PathBuf::from("."),
         },
         client,
@@ -62,7 +74,6 @@ async fn task_run_fast_and_slow_paths_with_task_wait() -> Result<()> {
         .task_run(TaskRunRequest {
             cmd: CommandSpec::parse(vec!["cargo".into(), "clippy".into()])?,
             cwd: None,
-            env: Vec::new(),
             name: Some("lint".into()),
             wait_timeout: Duration::from_millis(500),
             placement: PlacementRequest::Auto,
@@ -89,7 +100,6 @@ async fn task_run_fast_and_slow_paths_with_task_wait() -> Result<()> {
         .task_run(TaskRunRequest {
             cmd: CommandSpec::parse(vec!["cargo".into(), "test".into()])?,
             cwd: None,
-            env: Vec::new(),
             name: Some("test".into()),
             wait_timeout: Duration::from_millis(20),
             placement: PlacementRequest::Auto,
@@ -337,7 +347,6 @@ async fn confirm_destructive_blocks_when_user_denies() -> Result<()> {
         .task_run(TaskRunRequest {
             cmd: CommandSpec::parse(vec!["sleep".into(), "60".into()])?,
             cwd: None,
-            env: Vec::new(),
             name: None,
             wait_timeout: Duration::from_millis(10),
             placement: PlacementRequest::Auto,
@@ -360,5 +369,165 @@ async fn confirm_destructive_blocks_when_user_denies() -> Result<()> {
         err.downcast_ref::<DomainError>(),
         Some(&DomainError::UserDeniedConfirmation)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_kills_only_server_created_sessions_unless_keep_session() -> Result<()> {
+    // 1. Server-created session with keep_session=false -> killed on shutdown.
+    let (orch_created, ctrl_created) = make_orchestrator_with_keep("created-sess", false, false)?;
+    orch_created.initialize().await?;
+    orch_created.shutdown().await;
+    assert!(
+        ctrl_created
+            .recorded_actions()
+            .iter()
+            .any(|a| a == "kill_session")
+    );
+
+    // 2. Server-created session with keep_session=true -> NOT killed.
+    let (orch_keep, ctrl_keep) = make_orchestrator_with_keep("keep-sess", false, true)?;
+    orch_keep.initialize().await?;
+    orch_keep.shutdown().await;
+    assert!(
+        !ctrl_keep
+            .recorded_actions()
+            .iter()
+            .any(|a| a == "kill_session")
+    );
+
+    // 3. Reused / inherited session with keep_session=false -> NOT killed.
+    let (orch_reused, ctrl_reused) = make_orchestrator_with_keep("reused-sess", false, false)?;
+    ctrl_reused.set_session_preexisting(true);
+    orch_reused.initialize().await?;
+    orch_reused.shutdown().await;
+    assert!(
+        !ctrl_reused
+            .recorded_actions()
+            .iter()
+            .any(|a| a == "kill_session")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn dead_session_errors_propagate_across_all_tools() -> Result<()> {
+    let (orch, ctrl) = make_orchestrator("mock-dead", false)?;
+    orch.initialize().await?;
+
+    let (running, _) = orch
+        .task_run(TaskRunRequest {
+            cmd: CommandSpec::parse(vec!["sleep".into(), "60".into()])?,
+            cwd: None,
+            name: Some("long".into()),
+            wait_timeout: Duration::from_millis(10),
+            placement: PlacementRequest::Auto,
+        })
+        .await?;
+    let task_id = match running {
+        TaskRunOutcome::Running { task_id, .. } => task_id,
+        TaskRunOutcome::Completed { .. } => panic!("expected running"),
+    };
+
+    let svc_name = ServiceName::parse("svc")?;
+    let _ = orch
+        .service_start(ServiceStartRequest {
+            name: svc_name.clone(),
+            cmd: CommandSpec::parse(vec!["sleep".into(), "60".into()])?,
+            cwd: None,
+            ready_pattern: None,
+            ready_timeout: Duration::from_millis(50),
+            placement: PlacementRequest::Auto,
+        })
+        .await?;
+
+    let repl_name = ReplName::parse("py")?;
+    let orch_bg = orch.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        orch_bg
+            .inject_viewport_frame(SubscribeFrame {
+                pane_id: TerminalPaneId::new(3),
+                viewport_lines: vec![">>>".into()],
+            })
+            .await;
+    });
+    let _ = orch
+        .repl_open(ReplOpenRequest {
+            name: repl_name.clone(),
+            cmd: CommandSpec::parse(vec!["python3".into()])?,
+            cwd: None,
+            prompt_pattern: Some(CompiledPattern::parse("prompt_pattern", r"^>>> $")?),
+            placement: PlacementRequest::Floating,
+        })
+        .await?;
+
+    // Externally kill the session.
+    ctrl.kill_session_externally();
+
+    let assert_session_not_found = |res: Result<_>| match res {
+        Ok(_) => panic!("expected SessionNotFound error"),
+        Err(err) => assert!(
+            matches!(
+                err.downcast_ref::<DomainError>(),
+                Some(DomainError::SessionNotFound(_))
+            ),
+            "expected SessionNotFound, got: {err:?}"
+        ),
+    };
+
+    assert_session_not_found(orch.workspace_status().await.map(|_| ()));
+    assert_session_not_found(
+        orch.service_stop(&svc_name, PaneClosePolicy::ClosePane)
+            .await
+            .map(|_| ()),
+    );
+    assert_session_not_found(
+        orch.task_cancel(&task_id, PaneClosePolicy::KeepPane)
+            .await
+            .map(|_| ()),
+    );
+    assert_session_not_found(orch.repl_close(&repl_name).await.map(|_| ()));
+    assert_session_not_found(
+        orch.repl_exec(ReplExecRequest {
+            name: repl_name,
+            input: ReplInput::Paste {
+                text: "1+1".into(),
+                enter: EnterPolicy::SendEnter,
+            },
+            wait_for_prompt: None,
+            timeout: Duration::from_secs(5),
+        })
+        .await
+        .map(|_| ()),
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn headless_stacked_fallback_and_closed_task_logs_hint() -> Result<()> {
+    let (orch, ctrl) = make_orchestrator("mock-stacked", false)?;
+    orch.initialize().await?;
+    ctrl.set_fail_stacked(true);
+
+    let (running, _) = orch
+        .task_run(TaskRunRequest {
+            cmd: CommandSpec::parse(vec!["sleep".into(), "60".into()])?,
+            cwd: None,
+            name: Some("stacked-job".into()),
+            wait_timeout: Duration::from_millis(10),
+            placement: PlacementRequest::Stacked,
+        })
+        .await?;
+    let task_id = match running {
+        TaskRunOutcome::Running { task_id, .. } => task_id,
+        TaskRunOutcome::Completed { .. } => panic!("expected running"),
+    };
+
+    let _ = orch
+        .task_cancel(&task_id, PaneClosePolicy::ClosePane)
+        .await?;
+    let (logs, _) = orch.task_logs(&task_id, 20, None).await?;
+    assert!(logs.pane_closed);
     Ok(())
 }

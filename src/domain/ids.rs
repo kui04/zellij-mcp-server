@@ -426,21 +426,9 @@ impl CommandSpec {
         &self.args
     }
 
-    /// Returns the full argv vector, optionally prefixed with `env KEY=VAL ... --` when `env` is
-    /// non-empty, because `zellij action new-pane` has no native `--env` flag.
-    pub fn to_zellij_argv(&self, env: &[(String, String)]) -> Vec<String> {
-        if env.is_empty() {
-            let mut argv = Vec::with_capacity(1 + self.args.len());
-            argv.push(self.program.clone());
-            argv.extend(self.args.iter().cloned());
-            return argv;
-        }
-        let mut argv = Vec::with_capacity(3 + env.len() + self.args.len());
-        argv.push("env".to_owned());
-        for (k, v) in env {
-            argv.push(format!("{k}={v}"));
-        }
-        argv.push("--".to_owned());
+    /// Returns the full argv vector passed after `--` to `zellij action new-pane`.
+    pub fn to_zellij_argv(&self) -> Vec<String> {
+        let mut argv = Vec::with_capacity(1 + self.args.len());
         argv.push(self.program.clone());
         argv.extend(self.args.iter().cloned());
         argv
@@ -487,6 +475,21 @@ impl CompiledPattern {
 
     pub fn is_match(&self, text: &str) -> bool {
         self.regex.is_match(text)
+    }
+
+    /// Matches a terminal screen line, tolerating Zellij's stripping of trailing spaces on prompt
+    /// lines (e.g. `">>> "` dumped as `">>>"`).
+    pub fn matches_terminal_line(&self, line: &str) -> bool {
+        if self.regex.is_match(line) {
+            return true;
+        }
+        if !line.ends_with(' ') {
+            let mut with_space = String::with_capacity(line.len() + 1);
+            with_space.push_str(line);
+            with_space.push(' ');
+            return self.regex.is_match(&with_space);
+        }
+        false
     }
 }
 
@@ -591,7 +594,14 @@ impl ReplInput {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Self::SendKeys(parsed))
             }
-            (Some(_), Some(_)) | (None, None) => Err(ParseError::AmbiguousReplInput),
+            (Some(text), Some(_)) => {
+                if text.is_empty() {
+                    Err(ParseError::EmptyInputWithKeys)
+                } else {
+                    Err(ParseError::BothReplInputAndKeys)
+                }
+            }
+            (None, None) => Err(ParseError::MissingReplInput),
         }
     }
 }

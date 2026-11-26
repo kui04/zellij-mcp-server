@@ -45,27 +45,42 @@ async fn real_zellij_task_service_and_repl_end_to_end() -> Result<()> {
     let client = ZellijClient::new(PathBuf::from("zellij"), session_name.clone());
     let orch = WorkspaceOrchestrator::new(
         OrchestratorConfig {
-            session_resolution: SessionResolution::GeneratedUnique(session_name),
+            session_resolution: SessionResolution::GeneratedUnique(session_name.clone()),
             confirm_destructive: false,
+            keep_session: false,
             default_cwd: std::env::current_dir()?,
         },
-        client,
+        client.clone(),
     );
 
     orch.initialize().await?;
     // Allow background `zellij events` subprocess a brief moment to attach.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // 1. Fast-path finite task
+    // 0. Restarting / attaching a second orchestrator against an already-running session succeeds
+    //    and its shutdown must NOT kill the pre-existing session.
+    let second_orch = WorkspaceOrchestrator::new(
+        OrchestratorConfig {
+            session_resolution: SessionResolution::Explicit(session_name.clone()),
+            confirm_destructive: false,
+            keep_session: false,
+            default_cwd: std::env::current_dir()?,
+        },
+        client.clone(),
+    );
+    second_orch.initialize().await?;
+    second_orch.shutdown().await;
+    assert!(client.session_exists().await?);
+
+    // 1. Fast-path finite task + exact tail_lines check (no off-by-one trailing blank row)
     let (fast, _) = orch
         .task_run(TaskRunRequest {
             cmd: CommandSpec::parse(vec![
                 "sh".into(),
                 "-c".into(),
-                "echo e2e-fast-ok; exit 0".into(),
+                "printf 'L1\\nL2\\nL3\\n'; exit 0".into(),
             ])?,
             cwd: None,
-            env: Vec::new(),
             name: Some("fast".into()),
             wait_timeout: Duration::from_secs(5),
             placement: PlacementRequest::Auto,
@@ -74,6 +89,7 @@ async fn real_zellij_task_service_and_repl_end_to_end() -> Result<()> {
 
     match fast {
         TaskRunOutcome::Completed {
+            task_id,
             status,
             exit_code,
             output,
@@ -82,12 +98,26 @@ async fn real_zellij_task_service_and_repl_end_to_end() -> Result<()> {
             assert_eq!(status, "completed");
             assert_eq!(exit_code, Some(0));
             assert!(
-                output.contains("e2e-fast-ok"),
-                "expected e2e-fast-ok in output, got: {output:?}"
+                output.contains("L3"),
+                "expected L3 in output, got: {output:?}"
             );
+            let (tailed, _) = orch.task_logs(&task_id, 2, None).await?;
+            assert_eq!(tailed.output, "L2\nL3");
         }
         TaskRunOutcome::Running { .. } => panic!("expected fast task to complete within 5s"),
     }
+
+    // 1b. Headless placement="stacked" succeeds via floating fallback
+    let (stacked_fast, _) = orch
+        .task_run(TaskRunRequest {
+            cmd: CommandSpec::parse(vec!["sh".into(), "-c".into(), "echo stacked-ok".into()])?,
+            cwd: None,
+            name: Some("stacked".into()),
+            wait_timeout: Duration::from_secs(5),
+            placement: PlacementRequest::Stacked,
+        })
+        .await?;
+    assert!(matches!(stacked_fast, TaskRunOutcome::Completed { .. }));
 
     // 2. Slow-path finite task + zero-polling task_wait
     let (slow, _) = orch
@@ -98,7 +128,6 @@ async fn real_zellij_task_service_and_repl_end_to_end() -> Result<()> {
                 "sleep 0.5; echo e2e-slow-ok; exit 0".into(),
             ])?,
             cwd: None,
-            env: Vec::new(),
             name: Some("slow".into()),
             wait_timeout: Duration::from_millis(50),
             placement: PlacementRequest::Auto,
@@ -149,9 +178,13 @@ async fn real_zellij_task_service_and_repl_end_to_end() -> Result<()> {
     assert!(svc_reused.reused);
     assert_eq!(svc_reused.pane_id, svc.pane_id);
 
-    let _ = orch
+    let (_stop_status, stop_alerts) = orch
         .service_stop(&svc_name, PaneClosePolicy::ClosePane)
         .await?;
+    assert!(
+        stop_alerts.is_empty(),
+        "expected no false crash alerts on service_stop, got: {stop_alerts:?}"
+    );
 
     // 4. Interactive REPL open + exec + close
     let repl_name = ReplName::parse("e2e-sh")?;
@@ -186,7 +219,9 @@ async fn real_zellij_task_service_and_repl_end_to_end() -> Result<()> {
 
     let _ = orch.repl_close(&repl_name).await?;
 
-    // 5. Graceful shutdown stops stream subprocesses cleanly.
+    // 5. Graceful shutdown stops stream subprocesses and kills the server-created session.
     orch.shutdown().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!client.session_exists().await?);
     Ok(())
 }

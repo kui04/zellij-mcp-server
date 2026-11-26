@@ -195,17 +195,12 @@ impl ZellijMcpServer {
         let cmd = CommandSpec::parse(params.cmd).map_err(map_parse_err)?;
         let wait_timeout =
             parse_duration_ms(params.wait_ms, DEFAULT_TASK_FAST_WAIT).map_err(map_parse_err)?;
-        let env = params
-            .env
-            .map(|m| m.into_iter().collect())
-            .unwrap_or_default();
 
         let (outcome, alerts) = self
             .orchestrator
             .task_run(TaskRunRequest {
                 cmd,
                 cwd: params.cwd.map(PathBuf::from),
-                env,
                 name: params.name,
                 wait_timeout,
                 placement: map_placement(params.placement),
@@ -342,17 +337,23 @@ impl ZellijMcpServer {
             .map_err(map_parse_err)?;
         let tail_lines = params.tail_lines.unwrap_or(100);
 
-        let (output, alerts) = self
+        let (outcome, alerts) = self
             .orchestrator
             .task_logs(&task_id, tail_lines, grep.as_ref())
             .await
             .map_err(map_runtime_err)?;
 
+        let hint = if outcome.pane_closed && outcome.output.is_empty() {
+            Some("Pane has already been closed; no buffered logs are available.".to_owned())
+        } else {
+            None
+        };
+
         Ok(Json(TaskLogsResponse {
             task_id: task_id.to_string(),
-            output,
+            output: outcome.output,
             alerts: map_alerts(alerts),
-            hint: None,
+            hint,
         }))
     }
 

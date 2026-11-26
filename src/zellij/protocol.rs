@@ -7,10 +7,33 @@ use serde::Deserialize;
 
 use crate::domain::ids::{PaneId, TabId, TerminalPaneId};
 use crate::domain::layout::ViewportSnapshot;
+use crate::logs::strip_ansi;
 use crate::state::{ObservedPane, ObservedTab, ZellijEvent};
 
 /// Minimum Zellij version required for `zellij events` and JSON introspection.
 pub const MIN_ZELLIJ_VERSION: (u32, u32, u32) = (0, 46, 1);
+
+/// Returns `true` when Zellij stderr indicates the target session does not exist.
+///
+/// In Zellij 0.46, `zellij --session <missing> action ...` exits with status 0 while printing
+/// `Session '<name>' not found.` to stderr and the active session list to stdout.
+pub fn is_session_not_found_stderr(stderr: &str) -> bool {
+    let clean = strip_ansi(stderr);
+    clean.contains("No active zellij sessions found")
+        || (clean.contains("Session") && clean.contains("not found"))
+}
+
+/// Checks whether `session` appears as a live (non-exited) entry in `zellij list-sessions -n`.
+pub fn is_active_session_in_list(stdout: &str, session: &str) -> bool {
+    stdout.lines().any(|line| {
+        let clean = strip_ansi(line);
+        let mut parts = clean.split_whitespace();
+        let Some(name) = parts.next() else {
+            return false;
+        };
+        name == session && !clean.contains("(EXITED")
+    })
+}
 
 /// Parsed viewport update frame emitted by `zellij subscribe --format json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +72,8 @@ pub fn parse_zellij_version(stdout: &str) -> Result<(u32, u32, u32)> {
 
 /// Parses stdout of `zellij action new-tab` (single tab ID integer).
 pub fn parse_new_tab_output(stdout: &str) -> Result<TabId> {
-    let trimmed = stdout.trim();
+    let clean = strip_ansi(stdout);
+    let trimmed = clean.trim();
     let id = trimmed
         .parse::<u32>()
         .with_context(|| format!("invalid tab id from new-tab: {trimmed:?}"))?;
@@ -58,7 +82,8 @@ pub fn parse_new_tab_output(stdout: &str) -> Result<TabId> {
 
 /// Parses stdout of `zellij action new-pane` (`terminal_<id>`).
 pub fn parse_new_pane_output(stdout: &str) -> Result<TerminalPaneId> {
-    let trimmed = stdout.trim();
+    let clean = strip_ansi(stdout);
+    let trimmed = clean.trim();
     trimmed
         .parse::<TerminalPaneId>()
         .with_context(|| format!("invalid pane id from new-pane: {trimmed:?}"))

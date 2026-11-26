@@ -4,6 +4,7 @@ pub mod cache;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -27,13 +28,13 @@ use crate::domain::lifecycle::{
 };
 use crate::logs::{
     BoundedLogBuffer, DEFAULT_TRUNCATE_HEAD, DEFAULT_TRUNCATE_TAIL, LogSlice,
-    filter_and_tail_lines, strip_ansi, truncate_head_tail,
+    filter_and_tail_lines, strip_ansi, trim_trailing_blank_lines, truncate_head_tail,
 };
-use crate::runtime::cache::{CachedPaneEntry, SessionCache, load_cache, save_cache};
+use crate::runtime::cache::{CachedPaneEntry, SessionCache, load_cache, remove_cache, save_cache};
 use crate::state::{
     ManagedRecord, ReconciliationSnapshot, StateStore, TransitionEffects, ZellijEvent,
 };
-use crate::zellij::cli::{NewPaneSpec, ZellijClient};
+use crate::zellij::cli::{NewPaneSpec, SessionAttachment, ZellijClient};
 use crate::zellij::protocol::SubscribeFrame;
 use crate::zellij::streams::{StreamConfig, StreamHandles, spawn_streams};
 
@@ -71,6 +72,7 @@ fn interactive_auth_regex() -> &'static Regex {
 pub struct OrchestratorConfig {
     pub session_resolution: SessionResolution,
     pub confirm_destructive: bool,
+    pub keep_session: bool,
     pub default_cwd: PathBuf,
 }
 
@@ -79,10 +81,16 @@ pub struct OrchestratorConfig {
 pub struct TaskRunRequest {
     pub cmd: CommandSpec,
     pub cwd: Option<PathBuf>,
-    pub env: Vec<(String, String)>,
     pub name: Option<String>,
     pub wait_timeout: Duration,
     pub placement: PlacementRequest,
+}
+
+/// Outcome of `task_logs`.
+#[derive(Debug, Clone)]
+pub struct TaskLogsOutcome {
+    pub output: String,
+    pub pane_closed: bool,
 }
 
 /// Outcome of `task_run` (fast-path terminal state or seamless async handoff).
@@ -202,6 +210,20 @@ struct OrchestratorInner {
     /// Monotonic state generation counter preventing lost wakeups across async waiters.
     state_gen: watch::Sender<u64>,
     streams: Mutex<Option<StreamHandles>>,
+    /// Whether this server instance created the Zellij session (eligible for cleanup on exit).
+    created_session: AtomicBool,
+}
+
+fn is_session_not_found(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<DomainError>(),
+        Some(DomainError::SessionNotFound(_))
+    )
+}
+
+fn is_headless_stacked_error(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains("A connected client or a target pane is required")
 }
 
 impl WorkspaceOrchestrator {
@@ -217,6 +239,7 @@ impl WorkspaceOrchestrator {
                 provision_lock: Mutex::new(()),
                 state_gen,
                 streams: Mutex::new(None),
+                created_session: AtomicBool::new(false),
             }),
         }
     }
@@ -233,11 +256,28 @@ impl WorkspaceOrchestrator {
         self.inner.state_gen.subscribe()
     }
 
+    async fn mark_session_dead(&self) {
+        let mut store = self.inner.state.write().await;
+        store.session_dead = true;
+        drop(store);
+        self.bump_state_gen();
+    }
+
+    async fn ensure_session_alive(&self) -> Result<()> {
+        if self.inner.state.read().await.session_dead {
+            return Err(DomainError::SessionNotFound(self.inner.client.session().clone()).into());
+        }
+        Ok(())
+    }
+
     /// Runs startup checks (`zellij --version`, `ensure_session`), loads cache, reconciles
     /// against live Zellij state, and spawns the background `events` + `subscribe` streams.
     pub async fn initialize(&self) -> Result<()> {
         let _ = self.inner.client.check_version().await?;
-        self.inner.client.ensure_session().await?;
+        let attachment = self.inner.client.ensure_session().await?;
+        self.inner
+            .created_session
+            .store(attachment == SessionAttachment::Created, Ordering::Relaxed);
 
         let cached = load_cache(self.inner.client.session()).await?;
         self.reconcile_now().await?;
@@ -303,11 +343,22 @@ impl WorkspaceOrchestrator {
         Ok(())
     }
 
-    /// Gracefully stops background stream subprocesses without destroying the Zellij session.
+    /// Gracefully stops background stream subprocesses and kills the Zellij session if it was
+    /// created by this server instance (unless `--keep-session` is set).
     pub async fn shutdown(&self) {
         let handles = self.inner.streams.lock().await.take();
         if let Some(handles) = handles {
             handles.shutdown().await;
+        }
+        if !self.inner.config.keep_session && self.inner.created_session.load(Ordering::Relaxed) {
+            if let Err(err) = self.inner.client.kill_session().await {
+                warn!(
+                    session = %self.inner.client.session(),
+                    error = %err,
+                    "failed to kill server-created Zellij session on shutdown"
+                );
+            }
+            remove_cache(self.inner.client.session()).await;
         }
     }
 
@@ -385,11 +436,20 @@ impl WorkspaceOrchestrator {
     }
 
     async fn reconcile_now(&self) -> Result<()> {
-        let (tabs, panes, active_tab) = tokio::try_join!(
+        let joined = tokio::try_join!(
             self.inner.client.list_tabs(),
             self.inner.client.list_panes(),
             self.inner.client.current_tab_info(),
-        )?;
+        );
+        let (tabs, panes, active_tab) = match joined {
+            Ok(res) => res,
+            Err(err) => {
+                if is_session_not_found(&err) {
+                    self.mark_session_dead().await;
+                }
+                return Err(err);
+            }
+        };
         let effects = {
             let mut store = self.inner.state.write().await;
             store.reconcile(
@@ -413,7 +473,6 @@ impl WorkspaceOrchestrator {
         pane_title: String,
         cwd: PathBuf,
         cmd: CommandSpec,
-        env: Vec<(String, String)>,
     ) -> Result<(TabId, TerminalPaneId, ResolvedPlacement)> {
         let plan = {
             let store = self.inner.state.read().await;
@@ -430,6 +489,7 @@ impl WorkspaceOrchestrator {
             LayoutRouter::plan(&store.layout, kind, request, active_tasks, active_services)
         };
 
+        let mut tab_fell_back = false;
         let target_tab_id = match plan.target_tab {
             TargetTab::ActiveTab(id) => id,
             TargetTab::ManagedTab {
@@ -443,8 +503,8 @@ impl WorkspaceOrchestrator {
                 kind: tab_kind,
                 existing: None,
             } => {
-                // Zellij 0.46.1 in headless `--create-background` sessions without an attached
-                // client may return empty stdout or a non-materialized tab ID from `new-tab`.
+                // Zellij 0.46 in headless `--create-background` sessions without an attached
+                // client may return a non-materialized tab ID from `new-tab`.
                 // Verify via `list-tabs` and fall back cleanly to the existing tab if absent.
                 let maybe_created = match self.inner.client.new_tab(tab_kind.tab_name()).await {
                     Ok(created) => {
@@ -456,6 +516,10 @@ impl WorkspaceOrchestrator {
                             .map(|tabs| tabs.iter().any(|t| t.tab_id == created))
                             .unwrap_or(false);
                         if materialized { Some(created) } else { None }
+                    }
+                    Err(err) if is_session_not_found(&err) => {
+                        self.mark_session_dead().await;
+                        return Err(err);
                     }
                     Err(err) => {
                         warn!(
@@ -476,27 +540,71 @@ impl WorkspaceOrchestrator {
                     }
                     Some(created)
                 } else {
+                    tab_fell_back = true;
                     let store = self.inner.state.read().await;
                     store.layout.active_tab_id
                 }
             }
         };
 
-        let pane_id = self
-            .inner
-            .client
-            .new_pane(&NewPaneSpec {
-                tab_id: target_tab_id,
-                name: pane_title,
-                placement: plan.placement,
-                stacked: plan.open_stacked,
-                cwd: Some(cwd),
-                cmd,
-                env,
-            })
-            .await?;
+        // When `background_tab` could not materialize a new tab in a headless session, avoid
+        // requesting `--stacked` on the fallback tab (which fails without a connected client).
+        let initial_stacked = if tab_fell_back {
+            false
+        } else {
+            plan.open_stacked
+        };
+        let mut effective_placement = plan.placement;
+        let initial_spec = NewPaneSpec {
+            tab_id: target_tab_id,
+            name: pane_title.clone(),
+            placement: effective_placement,
+            stacked: initial_stacked,
+            cwd: Some(cwd.clone()),
+            cmd: cmd.clone(),
+        };
+
+        let pane_id = match self.inner.client.new_pane(&initial_spec).await {
+            Ok(id) => id,
+            Err(err) if is_session_not_found(&err) => {
+                self.mark_session_dead().await;
+                return Err(err);
+            }
+            Err(err)
+                if is_headless_stacked_error(&err)
+                    || (tab_fell_back && effective_placement != ResolvedPlacement::Floating) =>
+            {
+                // Headless sessions reject `--stacked` (no focused client pane) and can run out
+                // of tiled split space on a 50x48 fallback tab; retry as a floating pane.
+                warn!(
+                    requested = ?effective_placement,
+                    error = %err,
+                    "new-pane failed in headless/fallback layout; retrying as floating pane"
+                );
+                effective_placement = ResolvedPlacement::Floating;
+                let fallback_spec = NewPaneSpec {
+                    tab_id: target_tab_id,
+                    name: pane_title,
+                    placement: ResolvedPlacement::Floating,
+                    stacked: false,
+                    cwd: Some(cwd),
+                    cmd,
+                };
+                match self.inner.client.new_pane(&fallback_spec).await {
+                    Ok(id) => id,
+                    Err(fb_err) => {
+                        if is_session_not_found(&fb_err) {
+                            self.mark_session_dead().await;
+                        }
+                        return Err(fb_err);
+                    }
+                }
+            }
+            Err(err) => return Err(err),
+        };
 
         if plan.trigger_tab_stack_swap
+            && !tab_fell_back
             && let Some(tab_id) = target_tab_id
             && self.inner.client.apply_stacked_layout(tab_id).await?
         {
@@ -505,7 +613,7 @@ impl WorkspaceOrchestrator {
         }
 
         let effective_tab_id = target_tab_id.unwrap_or(TabId::new(0));
-        Ok((effective_tab_id, pane_id, plan.placement))
+        Ok((effective_tab_id, pane_id, effective_placement))
     }
 
     async fn maybe_confirm_destructive(&self, message: &str) -> Result<()> {
@@ -530,9 +638,10 @@ impl WorkspaceOrchestrator {
     ) -> String {
         if let Ok(raw) = self.inner.client.dump_screen(pane_id, false).await {
             let cleaned = strip_ansi(&raw);
-            let lines: Vec<String> = cleaned.lines().map(ToOwned::to_owned).collect();
-            if !lines.is_empty() {
-                return truncate_head_tail(&lines, DEFAULT_TRUNCATE_HEAD, DEFAULT_TRUNCATE_TAIL);
+            let all_lines: Vec<String> = cleaned.lines().map(ToOwned::to_owned).collect();
+            let trimmed = trim_trailing_blank_lines(&all_lines);
+            if !trimmed.is_empty() {
+                return truncate_head_tail(trimmed, DEFAULT_TRUNCATE_HEAD, DEFAULT_TRUNCATE_TAIL);
             }
         }
         let store = self.inner.state.read().await;
@@ -583,7 +692,6 @@ impl WorkspaceOrchestrator {
                 pane_title.clone(),
                 cwd.clone(),
                 req.cmd.clone(),
-                req.env.clone(),
             )
             .await?
         };
@@ -599,7 +707,6 @@ impl WorkspaceOrchestrator {
                 placement,
                 cmd: req.cmd,
                 cwd,
-                env: req.env,
                 ready_pattern: None,
                 prompt_pattern: None,
                 lifecycle: EntityLifecycle::Task(TaskLifecycle::Running { started_at: now }),
@@ -675,6 +782,7 @@ impl WorkspaceOrchestrator {
         mode: WaitMode,
         timeout: Duration,
     ) -> Result<(TaskWaitOutcome, Vec<WorkspaceAlert>)> {
+        self.ensure_session_alive().await?;
         {
             let store = self.inner.state.read().await;
             for task_id in &task_ids {
@@ -689,7 +797,7 @@ impl WorkspaceOrchestrator {
         let mut timed_out = false;
         loop {
             let _ = *gen_rx.borrow_and_update();
-            let done = {
+            let (done, session_dead) = {
                 let store = self.inner.state.read().await;
                 let terminal_count = task_ids
                     .iter()
@@ -699,11 +807,17 @@ impl WorkspaceOrchestrator {
                             .is_some_and(|r| !r.lifecycle.is_active())
                     })
                     .count();
-                match mode {
+                let is_done = match mode {
                     WaitMode::Any => terminal_count >= 1,
                     WaitMode::All => terminal_count == task_ids.len(),
-                }
+                };
+                (is_done, store.session_dead)
             };
+            if session_dead {
+                return Err(
+                    DomainError::SessionNotFound(self.inner.client.session().clone()).into(),
+                );
+            }
             if done {
                 break;
             }
@@ -755,7 +869,8 @@ impl WorkspaceOrchestrator {
         task_id: &TaskId,
         tail_lines: usize,
         grep: Option<&CompiledPattern>,
-    ) -> Result<(String, Vec<WorkspaceAlert>)> {
+    ) -> Result<(TaskLogsOutcome, Vec<WorkspaceAlert>)> {
+        self.ensure_session_alive().await?;
         let key = ManagedKey::Task(task_id.clone());
         let record = {
             let store = self.inner.state.read().await;
@@ -765,9 +880,26 @@ impl WorkspaceOrchestrator {
                 .ok_or_else(|| DomainError::TaskNotFound(task_id.clone()))?
         };
 
-        let output = if !record.lifecycle.is_active() {
+        let pane_closed = matches!(
+            record.lifecycle,
+            EntityLifecycle::Task(
+                TaskLifecycle::Completed {
+                    pane_closed: true,
+                    ..
+                } | TaskLifecycle::Cancelled {
+                    pane_closed: true,
+                    ..
+                } | TaskLifecycle::StoppedByUser { .. }
+            )
+        );
+
+        let output = if !record.lifecycle.is_active() && !pane_closed {
             match self.inner.client.dump_screen(record.pane_id, false).await {
                 Ok(raw) => filter_and_tail_lines(&raw, tail_lines, grep).join("\n"),
+                Err(err) if is_session_not_found(&err) => {
+                    self.mark_session_dead().await;
+                    return Err(err);
+                }
                 Err(_) => record
                     .logs
                     .query(None, tail_lines, grep)
@@ -789,7 +921,13 @@ impl WorkspaceOrchestrator {
         };
 
         let alerts = self.inner.state.write().await.drain_alerts();
-        Ok((output, alerts))
+        Ok((
+            TaskLogsOutcome {
+                output,
+                pane_closed,
+            },
+            alerts,
+        ))
     }
 
     pub async fn task_cancel(
@@ -797,6 +935,7 @@ impl WorkspaceOrchestrator {
         task_id: &TaskId,
         close_policy: PaneClosePolicy,
     ) -> Result<(String, Vec<WorkspaceAlert>)> {
+        self.ensure_session_alive().await?;
         let key = ManagedKey::Task(task_id.clone());
         let record = {
             let store = self.inner.state.read().await;
@@ -815,7 +954,12 @@ impl WorkspaceOrchestrator {
             let lock = self.pane_write_lock(record.pane_id).await;
             {
                 let _guard = lock.lock().await;
-                let _ = self.inner.client.send_keys(record.pane_id, &ctrl_c).await;
+                if let Err(err) = self.inner.client.send_keys(record.pane_id, &ctrl_c).await
+                    && is_session_not_found(&err)
+                {
+                    self.mark_session_dead().await;
+                    return Err(err);
+                }
             }
 
             let exited = self.wait_until_inactive(&key, CANCEL_GRACE_PERIOD).await;
@@ -824,11 +968,16 @@ impl WorkspaceOrchestrator {
                 let ctrl_backslash = vec![KeyChord::parse(r"Ctrl \")?];
                 {
                     let _guard = lock.lock().await;
-                    let _ = self
+                    if let Err(err) = self
                         .inner
                         .client
                         .send_keys(record.pane_id, &ctrl_backslash)
-                        .await;
+                        .await
+                        && is_session_not_found(&err)
+                    {
+                        self.mark_session_dead().await;
+                        return Err(err);
+                    }
                 }
                 let _ = self
                     .wait_until_inactive(&key, Duration::from_millis(500))
@@ -838,6 +987,32 @@ impl WorkspaceOrchestrator {
         }
 
         let mut visual_actions = Vec::new();
+        let pane_closed = close_policy == PaneClosePolicy::ClosePane;
+        if pane_closed {
+            visual_actions.push(VisualAction::ClosePane {
+                pane_id: record.pane_id,
+            });
+        }
+        if was_active {
+            let title = PaneTitleCodec::format("[STOP]", &key, record.label.as_deref());
+            visual_actions.insert(
+                0,
+                VisualAction::RenamePane {
+                    pane_id: record.pane_id,
+                    title,
+                },
+            );
+        }
+
+        for action in &visual_actions {
+            if let Err(err) = self.inner.client.apply_visual_action(action).await
+                && is_session_not_found(&err)
+            {
+                self.mark_session_dead().await;
+                return Err(err);
+            }
+        }
+
         let final_status = {
             let mut store = self.inner.state.write().await;
             if let Some(rec) = store.get_mut(&key) {
@@ -848,13 +1023,22 @@ impl WorkspaceOrchestrator {
                         started_at,
                         ended_at: SystemTime::now(),
                         exit_code,
+                        pane_closed,
                     });
-                    let title = PaneTitleCodec::format("[STOP]", &key, rec.label.as_deref());
-                    rec.pane_title = title.clone();
-                    visual_actions.push(VisualAction::RenamePane {
-                        pane_id: rec.pane_id,
-                        title,
-                    });
+                    rec.pane_title = PaneTitleCodec::format("[STOP]", &key, rec.label.as_deref());
+                } else if pane_closed
+                    && let EntityLifecycle::Task(
+                        TaskLifecycle::Completed {
+                            pane_closed: closed,
+                            ..
+                        }
+                        | TaskLifecycle::Cancelled {
+                            pane_closed: closed,
+                            ..
+                        },
+                    ) = &mut rec.lifecycle
+                {
+                    *closed = true;
                 }
                 rec.lifecycle.status_label().to_owned()
             } else {
@@ -862,19 +1046,13 @@ impl WorkspaceOrchestrator {
             }
         };
 
-        if close_policy == PaneClosePolicy::ClosePane {
-            visual_actions.push(VisualAction::ClosePane {
-                pane_id: record.pane_id,
-            });
+        if pane_closed {
             let _ = self
                 .inner
                 .pane_write_locks
                 .lock()
                 .await
                 .remove(&record.pane_id);
-        }
-        for action in &visual_actions {
-            let _ = self.inner.client.apply_visual_action(action).await;
         }
         self.sync_subscriptions().await;
         self.bump_state_gen();
@@ -917,7 +1095,10 @@ impl WorkspaceOrchestrator {
             {
                 let mut store = self.inner.state.write().await;
                 if let Some(existing) = store.get_service(&req.name)
-                    && existing.lifecycle.is_active()
+                    && matches!(
+                        existing.lifecycle,
+                        EntityLifecycle::Service(ref svc) if svc.is_reusable()
+                    )
                 {
                     let matched_line = match &existing.lifecycle {
                         EntityLifecycle::Service(ServiceLifecycle::Ready {
@@ -925,6 +1106,7 @@ impl WorkspaceOrchestrator {
                         }) => matched_line.clone(),
                         EntityLifecycle::Service(
                             ServiceLifecycle::Starting { .. }
+                            | ServiceLifecycle::Stopping { .. }
                             | ServiceLifecycle::Failed { .. }
                             | ServiceLifecycle::Stopped { .. }
                             | ServiceLifecycle::StoppedByUser { .. },
@@ -964,7 +1146,6 @@ impl WorkspaceOrchestrator {
                     pane_title.clone(),
                     cwd.clone(),
                     req.cmd.clone(),
-                    Vec::new(),
                 )
                 .await?;
 
@@ -993,7 +1174,6 @@ impl WorkspaceOrchestrator {
                     placement,
                     cmd: req.cmd,
                     cwd,
-                    env: Vec::new(),
                     ready_pattern: req.ready_pattern,
                     prompt_pattern: None,
                     lifecycle,
@@ -1041,6 +1221,7 @@ impl WorkspaceOrchestrator {
                 }
                 EntityLifecycle::Service(
                     ServiceLifecycle::Starting { .. }
+                    | ServiceLifecycle::Stopping { .. }
                     | ServiceLifecycle::Failed { .. }
                     | ServiceLifecycle::Stopped { .. }
                     | ServiceLifecycle::StoppedByUser { .. },
@@ -1079,6 +1260,7 @@ impl WorkspaceOrchestrator {
         since_seq: Option<LogSeq>,
         grep: Option<&CompiledPattern>,
     ) -> Result<(LogSlice, Vec<WorkspaceAlert>)> {
+        self.ensure_session_alive().await?;
         let mut store = self.inner.state.write().await;
         let rec = store
             .get_service(name)
@@ -1118,6 +1300,7 @@ impl WorkspaceOrchestrator {
         name: &ServiceName,
         close_policy: PaneClosePolicy,
     ) -> Result<(String, Vec<WorkspaceAlert>)> {
+        self.ensure_session_alive().await?;
         let key = ManagedKey::Service(name.clone());
         let record = {
             let store = self.inner.state.read().await;
@@ -1130,12 +1313,37 @@ impl WorkspaceOrchestrator {
         self.maybe_confirm_destructive(&format!("Stop service {name}?"))
             .await?;
 
+        let prev_lifecycle = record.lifecycle.clone();
         if record.lifecycle.is_active() {
+            // Mark the service as Stopping BEFORE sending Ctrl+C so the resulting `PaneExited`
+            // event is treated as an intentional stop instead of an unexpected crash.
+            {
+                let mut store = self.inner.state.write().await;
+                if let Some(rec) = store.get_mut(&key)
+                    && rec.lifecycle.is_active()
+                {
+                    let started_at = rec.lifecycle.started_at();
+                    rec.lifecycle =
+                        EntityLifecycle::Service(ServiceLifecycle::Stopping { started_at });
+                }
+            }
+
             let ctrl_c = vec![KeyChord::parse("Ctrl c")?];
             let lock = self.pane_write_lock(record.pane_id).await;
             {
                 let _guard = lock.lock().await;
-                let _ = self.inner.client.send_keys(record.pane_id, &ctrl_c).await;
+                if let Err(err) = self.inner.client.send_keys(record.pane_id, &ctrl_c).await
+                    && is_session_not_found(&err)
+                {
+                    let mut store = self.inner.state.write().await;
+                    if let Some(rec) = store.get_mut(&key) {
+                        rec.lifecycle = prev_lifecycle;
+                    }
+                    store.session_dead = true;
+                    drop(store);
+                    self.bump_state_gen();
+                    return Err(err);
+                }
             }
             // Wait briefly for the process to exit and release its port before closing the pane.
             if self.inner.client.binary_path().is_some() {
@@ -1145,7 +1353,25 @@ impl WorkspaceOrchestrator {
             }
         }
 
-        let mut actions = Vec::new();
+        let title = PaneTitleCodec::format("[STOP]", &key, None);
+        let mut actions = vec![VisualAction::RenamePane {
+            pane_id: record.pane_id,
+            title: title.clone(),
+        }];
+        if close_policy == PaneClosePolicy::ClosePane {
+            actions.push(VisualAction::ClosePane {
+                pane_id: record.pane_id,
+            });
+        }
+        for action in &actions {
+            if let Err(err) = self.inner.client.apply_visual_action(action).await
+                && is_session_not_found(&err)
+            {
+                self.mark_session_dead().await;
+                return Err(err);
+            }
+        }
+
         {
             let mut store = self.inner.state.write().await;
             if let Some(rec) = store.get_mut(&key) {
@@ -1154,27 +1380,16 @@ impl WorkspaceOrchestrator {
                     started_at,
                     ended_at: SystemTime::now(),
                 });
-                let title = PaneTitleCodec::format("[STOP]", &key, None);
-                rec.pane_title = title.clone();
-                actions.push(VisualAction::RenamePane {
-                    pane_id: rec.pane_id,
-                    title,
-                });
+                rec.pane_title = title;
             }
         }
         if close_policy == PaneClosePolicy::ClosePane {
-            actions.push(VisualAction::ClosePane {
-                pane_id: record.pane_id,
-            });
             let _ = self
                 .inner
                 .pane_write_locks
                 .lock()
                 .await
                 .remove(&record.pane_id);
-        }
-        for action in &actions {
-            let _ = self.inner.client.apply_visual_action(action).await;
         }
         self.sync_subscriptions().await;
         self.bump_state_gen();
@@ -1220,7 +1435,6 @@ impl WorkspaceOrchestrator {
                     pane_title.clone(),
                     cwd.clone(),
                     req.cmd.clone(),
-                    Vec::new(),
                 )
                 .await?;
 
@@ -1235,7 +1449,6 @@ impl WorkspaceOrchestrator {
                     placement,
                     cmd: req.cmd,
                     cwd,
-                    env: Vec::new(),
                     ready_pattern: None,
                     prompt_pattern: req.prompt_pattern.clone(),
                     lifecycle: EntityLifecycle::Repl(ReplLifecycle::Starting { started_at: now }),
@@ -1256,7 +1469,7 @@ impl WorkspaceOrchestrator {
                 req.prompt_pattern.as_ref(),
                 DEFAULT_REPL_EXEC_TIMEOUT,
             )
-            .await;
+            .await?;
 
         let (status, pane_title, rename_action) = {
             let mut store = self.inner.state.write().await;
@@ -1371,7 +1584,7 @@ impl WorkspaceOrchestrator {
         let effective_prompt = req.wait_for_prompt.as_ref().or(default_prompt.as_ref());
         let (delta_output, timed_out) = self
             .await_repl_output(&key, start_seq, effective_prompt, req.timeout)
-            .await;
+            .await?;
 
         let needs_human_input = timed_out && interactive_auth_regex().is_match(&delta_output);
         let (status, pane_title) = {
@@ -1448,7 +1661,7 @@ impl WorkspaceOrchestrator {
         since_seq: LogSeq,
         prompt_pattern: Option<&CompiledPattern>,
         timeout: Duration,
-    ) -> (String, bool) {
+    ) -> Result<(String, bool)> {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut gen_rx = self.subscribe_state_gen();
         let mut last_next_seq = since_seq;
@@ -1458,17 +1671,28 @@ impl WorkspaceOrchestrator {
 
         loop {
             let _ = *gen_rx.borrow_and_update();
-            let (slice, is_active, pane_id) = {
+            let (slice, is_active, pane_id, session_dead) = {
                 let store = self.inner.state.read().await;
+                if store.session_dead {
+                    return Err(
+                        DomainError::SessionNotFound(self.inner.client.session().clone()).into(),
+                    );
+                }
                 match store.get(key) {
                     Some(rec) => (
                         rec.logs.query(Some(since_seq), 200, None),
                         rec.lifecycle.is_active(),
                         rec.pane_id,
+                        store.session_dead,
                     ),
-                    None => return (String::new(), false),
+                    None => return Ok((String::new(), false)),
                 }
             };
+            if session_dead {
+                return Err(
+                    DomainError::SessionNotFound(self.inner.client.session().clone()).into(),
+                );
+            }
 
             if slice.next_seq > last_next_seq {
                 last_next_seq = slice.next_seq;
@@ -1484,25 +1708,26 @@ impl WorkspaceOrchestrator {
                 .join("\n");
 
             if !is_active {
-                return (joined, false);
+                return Ok((joined, false));
             }
 
             // Match `prompt_pattern` only against the last non-empty line so an echoed command
             // line (e.g. `>>> 2 + 2`) does not prematurely satisfy the prompt check.
+            // Use `matches_terminal_line` to tolerate Zellij stripping trailing spaces from prompts.
             if let Some(pat) = prompt_pattern
                 && let Some(last_line) = slice
                     .entries
                     .iter()
                     .rev()
                     .find(|e| !e.line.trim().is_empty())
-                && pat.is_match(&last_line.line)
+                && pat.matches_terminal_line(&last_line.line)
             {
-                return (joined, false);
+                return Ok((joined, false));
             }
 
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return (joined, true);
+                return Ok((joined, true));
             }
 
             let quiet_deadline = if prompt_pattern.is_none() && saw_output {
@@ -1522,28 +1747,36 @@ impl WorkspaceOrchestrator {
             {
                 let after = tokio::time::Instant::now();
                 if after >= deadline {
-                    return (joined, true);
+                    return Ok((joined, true));
                 }
                 if prompt_pattern.is_none() && saw_output && after >= quiet_deadline {
-                    return (joined, false);
+                    return Ok((joined, false));
                 }
-                // Zellij 0.46.1 headless background sessions do not always emit incremental
+                // Zellij 0.46 headless background sessions do not always emit incremental
                 // `subscribe` ticks for floating panes when no client is attached; refresh the
                 // visible viewport grid via `dump-screen` (without `--full`) and feed it through
                 // the standard viewport differ.
-                if let Ok(raw) = self.inner.client.dump_viewport(pane_id).await {
-                    let lines: Vec<String> = raw.lines().map(ToOwned::to_owned).collect();
-                    self.inject_viewport_frame(SubscribeFrame {
-                        pane_id,
-                        viewport_lines: lines,
-                    })
-                    .await;
+                match self.inner.client.dump_viewport(pane_id).await {
+                    Ok(raw) => {
+                        let lines: Vec<String> = raw.lines().map(ToOwned::to_owned).collect();
+                        self.inject_viewport_frame(SubscribeFrame {
+                            pane_id,
+                            viewport_lines: lines,
+                        })
+                        .await;
+                    }
+                    Err(err) if is_session_not_found(&err) => {
+                        self.mark_session_dead().await;
+                        return Err(err);
+                    }
+                    Err(_) => {}
                 }
             }
         }
     }
 
     pub async fn repl_close(&self, name: &ReplName) -> Result<(String, Vec<WorkspaceAlert>)> {
+        self.ensure_session_alive().await?;
         let key = ManagedKey::Repl(name.clone());
         let record = {
             let store = self.inner.state.read().await;
@@ -1560,14 +1793,24 @@ impl WorkspaceOrchestrator {
         {
             let _guard = lock.lock().await;
             let ctrl_d = vec![KeyChord::parse("Ctrl d")?];
-            let _ = self.inner.client.send_keys(record.pane_id, &ctrl_d).await;
-            let _ = self
+            if let Err(err) = self.inner.client.send_keys(record.pane_id, &ctrl_d).await
+                && is_session_not_found(&err)
+            {
+                self.mark_session_dead().await;
+                return Err(err);
+            }
+            if let Err(err) = self
                 .inner
                 .client
                 .apply_visual_action(&VisualAction::ClosePane {
                     pane_id: record.pane_id,
                 })
-                .await;
+                .await
+                && is_session_not_found(&err)
+            {
+                self.mark_session_dead().await;
+                return Err(err);
+            }
         }
         let _ = self
             .inner
@@ -1580,10 +1823,11 @@ impl WorkspaceOrchestrator {
             let mut store = self.inner.state.write().await;
             if let Some(rec) = store.get_mut(&key) {
                 let started_at = rec.lifecycle.started_at();
+                let observed_exit_code = rec.lifecycle.exit_code();
                 rec.lifecycle = EntityLifecycle::Repl(ReplLifecycle::Exited {
                     started_at,
                     ended_at: SystemTime::now(),
-                    exit_code: Some(0),
+                    exit_code: observed_exit_code,
                 });
             }
         }

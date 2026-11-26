@@ -134,7 +134,7 @@ impl Default for BoundedLogBuffer {
     }
 }
 
-fn trim_trailing_blank_lines(lines: &[String]) -> &[String] {
+pub fn trim_trailing_blank_lines(lines: &[String]) -> &[String] {
     let mut end = lines.len();
     while end > 0 && lines[end - 1].trim().is_empty() {
         end -= 1;
@@ -257,16 +257,21 @@ pub fn truncate_head_tail(lines: &[String], head: usize, tail: usize) -> String 
 }
 
 /// Filters raw lines (e.g. from `dump-screen --full`) by optional regex and tail count.
+///
+/// Trailing blank lines (such as the empty cursor row appended by `dump-screen --full`) are
+/// trimmed before applying `grep` and `tail_lines` so `tail_lines` counts real output lines.
 pub fn filter_and_tail_lines(
     raw_text: &str,
     tail_lines: usize,
     grep: Option<&CompiledPattern>,
 ) -> Vec<String> {
     let cleaned = strip_ansi(raw_text);
-    let mut lines: Vec<String> = cleaned
-        .lines()
+    let all_lines: Vec<String> = cleaned.lines().map(ToOwned::to_owned).collect();
+    let trimmed = trim_trailing_blank_lines(&all_lines);
+    let mut lines: Vec<String> = trimmed
+        .iter()
         .filter(|line| grep.is_none_or(|pat| pat.is_match(line)))
-        .map(ToOwned::to_owned)
+        .cloned()
         .collect();
 
     if lines.len() > tail_lines {

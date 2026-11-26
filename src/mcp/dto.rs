@@ -84,8 +84,6 @@ pub struct TaskRunParams {
     pub cmd: Vec<String>,
     /// Optional working directory.
     pub cwd: Option<String>,
-    /// Optional environment variables injected for this task.
-    pub env: Option<BTreeMap<String, String>>,
     /// Optional short label included in the Zellij pane title.
     pub name: Option<String>,
     /// Fast-path synchronous wait window in milliseconds (default: 3000).

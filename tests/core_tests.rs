@@ -23,8 +23,9 @@ use zellij_mcp_server::logs::{
 };
 use zellij_mcp_server::state::{ManagedRecord, ReconciliationSnapshot, StateStore, ZellijEvent};
 use zellij_mcp_server::zellij::protocol::{
-    parse_event_line, parse_list_panes_json, parse_list_tabs_json, parse_new_pane_output,
-    parse_new_tab_output, parse_subscribe_line, parse_zellij_version,
+    is_active_session_in_list, is_session_not_found_stderr, parse_event_line,
+    parse_list_panes_json, parse_list_tabs_json, parse_new_pane_output, parse_new_tab_output,
+    parse_subscribe_line, parse_zellij_version,
 };
 
 #[test]
@@ -71,19 +72,19 @@ fn pane_ids_and_command_spec_enforced_at_boundary() -> Result<()> {
 
     assert!(CommandSpec::parse(vec![]).is_err());
     let cmd = CommandSpec::parse(vec!["cargo".into(), "test".into()])?;
-    assert_eq!(cmd.to_zellij_argv(&[]), vec!["cargo", "test"]);
-    assert_eq!(
-        cmd.to_zellij_argv(&[("RUST_LOG".into(), "debug".into())]),
-        vec!["env", "RUST_LOG=debug", "--", "cargo", "test"]
-    );
+    assert_eq!(cmd.to_zellij_argv(), vec!["cargo", "test"]);
 
     assert_eq!(
         ReplInput::parse(Some("ls".into()), Some(vec!["Enter".into()]), true),
-        Err(ParseError::AmbiguousReplInput)
+        Err(ParseError::BothReplInputAndKeys)
+    );
+    assert_eq!(
+        ReplInput::parse(Some(String::new()), Some(vec!["Ctrl c".into()]), true),
+        Err(ParseError::EmptyInputWithKeys)
     );
     assert_eq!(
         ReplInput::parse(None, None, true),
-        Err(ParseError::AmbiguousReplInput)
+        Err(ParseError::MissingReplInput)
     );
     assert_eq!(
         ReplInput::parse(Some("ls".into()), None, true)?,
@@ -254,7 +255,6 @@ fn state_store_transitions_gc_and_reconciliation() -> Result<()> {
             placement: ResolvedPlacement::BackgroundTab,
             cmd: CommandSpec::parse(vec!["echo".into()])?,
             cwd: PathBuf::from("."),
-            env: Vec::new(),
             ready_pattern: None,
             prompt_pattern: None,
             lifecycle: EntityLifecycle::Task(TaskLifecycle::Running { started_at: t0 }),
@@ -289,7 +289,6 @@ fn state_store_transitions_gc_and_reconciliation() -> Result<()> {
         placement: ResolvedPlacement::BackgroundTab,
         cmd: CommandSpec::parse(vec!["pnpm".into(), "dev".into()])?,
         cwd: PathBuf::from("."),
-        env: Vec::new(),
         ready_pattern: None,
         prompt_pattern: None,
         lifecycle: EntityLifecycle::Service(ServiceLifecycle::Starting {
@@ -387,6 +386,72 @@ fn zellij_0_46_1_fixtures_parse_and_reconcile() -> Result<()> {
     assert_eq!(
         claimed.map(|r| r.lifecycle.status_label()),
         Some("completed")
+    );
+    Ok(())
+}
+
+#[test]
+fn regression_dead_session_detection_prompt_whitespace_tail_lines_and_stopping_service()
+-> Result<()> {
+    // Dead-session stderr & active session list parsing (with ANSI codes & EXITED sessions).
+    assert!(is_session_not_found_stderr(
+        "Session 'ghost' not found. The following sessions are active:\n"
+    ));
+    assert!(is_session_not_found_stderr(
+        "No active zellij sessions found.\n"
+    ));
+    assert!(!is_session_not_found_stderr(""));
+
+    let list_out = "\x1b[32;1mdev\x1b[m [Created 5m ago]\nold [Created 1h ago] (EXITED - attach to resurrect)\n";
+    assert!(is_active_session_in_list(list_out, "dev"));
+    assert!(!is_active_session_in_list(list_out, "old"));
+    assert!(!is_active_session_in_list(list_out, "missing"));
+
+    // Trailing-whitespace prompt regex matches Zellij-trimmed terminal lines.
+    let py_prompt = CompiledPattern::parse("prompt_pattern", r"^>>> $")?;
+    assert!(py_prompt.matches_terminal_line(">>>"));
+    assert!(py_prompt.matches_terminal_line(">>> "));
+    assert!(!py_prompt.matches_terminal_line(">>> 2 + 2"));
+
+    // `filter_and_tail_lines` ignores trailing blank cursor row from `dump-screen --full`.
+    let dumped = "L1\nL2\nL3\n\n";
+    assert_eq!(filter_and_tail_lines(dumped, 2, None), vec!["L2", "L3"]);
+
+    // Stopping a service intentionally does not produce a crash alert when `PaneExited` arrives.
+    let mut store = StateStore::new(SessionName::parse("demo")?);
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let svc_name = ServiceName::parse("api")?;
+    let svc_pane = TerminalPaneId::new(99);
+    let svc_key = ManagedKey::Service(svc_name.clone());
+    store.register(ManagedRecord {
+        key: svc_key,
+        tab_id: TabId::new(1),
+        pane_id: svc_pane,
+        pane_title: "[STOP] mcp:svc:api".into(),
+        label: None,
+        placement: ResolvedPlacement::BackgroundTab,
+        cmd: CommandSpec::parse(vec!["node".into()])?,
+        cwd: PathBuf::from("."),
+        ready_pattern: None,
+        prompt_pattern: None,
+        lifecycle: EntityLifecycle::Service(ServiceLifecycle::Stopping { started_at: t0 }),
+        logs: BoundedLogBuffer::default(),
+        last_viewport: Vec::new(),
+    });
+    let stop_fx = store.apply_event(
+        ZellijEvent::PaneExited {
+            pane_id: svc_pane,
+            exit_code: Some(130),
+        },
+        t0 + Duration::from_secs(1),
+    );
+    assert!(stop_fx.alerts.is_empty());
+    assert!(store.drain_alerts().is_empty());
+    assert_eq!(
+        store
+            .get_service(&svc_name)
+            .map(|r| r.lifecycle.status_label()),
+        Some("stopped")
     );
     Ok(())
 }

@@ -79,3 +79,15 @@ pub async fn save_cache(session: &SessionName, cache: &SessionCache) -> Result<(
         .with_context(|| format!("failed to atomically replace cache {}", path.display()))?;
     Ok(())
 }
+
+/// Removes the persisted session cache file if it exists.
+pub async fn remove_cache(session: &SessionName) {
+    let Some(path) = cache_path(session) else {
+        return;
+    };
+    if let Err(err) = tokio::fs::remove_file(&path).await
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(path = %path.display(), error = %err, "failed to remove session cache");
+    }
+}

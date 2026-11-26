@@ -32,6 +32,7 @@ pub enum TaskLifecycle {
         started_at: SystemTime,
         ended_at: SystemTime,
         exit_code: Option<i32>,
+        pane_closed: bool,
     },
     StoppedByUser {
         started_at: SystemTime,
@@ -92,6 +93,9 @@ pub enum ServiceLifecycle {
         ready_at: SystemTime,
         matched_line: Option<String>,
     },
+    Stopping {
+        started_at: SystemTime,
+    },
     Failed {
         started_at: SystemTime,
         ended_at: SystemTime,
@@ -111,15 +115,20 @@ pub enum ServiceLifecycle {
 impl ServiceLifecycle {
     pub const fn is_active(&self) -> bool {
         match self {
-            Self::Starting { .. } | Self::Ready { .. } => true,
+            Self::Starting { .. } | Self::Ready { .. } | Self::Stopping { .. } => true,
             Self::Failed { .. } | Self::Stopped { .. } | Self::StoppedByUser { .. } => false,
         }
+    }
+
+    pub const fn is_reusable(&self) -> bool {
+        matches!(self, Self::Starting { .. } | Self::Ready { .. })
     }
 
     pub const fn status_label(&self) -> &'static str {
         match self {
             Self::Starting { .. } => "starting",
             Self::Ready { .. } => "ready",
+            Self::Stopping { .. } => "stopping",
             Self::Failed { .. } => "failed",
             Self::Stopped { .. } => "stopped",
             Self::StoppedByUser { .. } => "stopped_by_user",
@@ -130,6 +139,7 @@ impl ServiceLifecycle {
         match self {
             Self::Starting { .. }
             | Self::Ready { .. }
+            | Self::Stopping { .. }
             | Self::Stopped { .. }
             | Self::StoppedByUser { .. } => None,
             Self::Failed { exit_code, .. } => *exit_code,
@@ -140,6 +150,7 @@ impl ServiceLifecycle {
         match self {
             Self::Starting { started_at, .. }
             | Self::Ready { started_at, .. }
+            | Self::Stopping { started_at }
             | Self::Failed { started_at, .. }
             | Self::Stopped { started_at, .. }
             | Self::StoppedByUser { started_at, .. } => *started_at,
@@ -244,9 +255,9 @@ impl EntityLifecycle {
                 ServiceLifecycle::Starting { .. } => VisualBadge::Run,
                 ServiceLifecycle::Ready { .. } => VisualBadge::Rdy,
                 ServiceLifecycle::Failed { exit_code, .. } => VisualBadge::Dead(*exit_code),
-                ServiceLifecycle::Stopped { .. } | ServiceLifecycle::StoppedByUser { .. } => {
-                    VisualBadge::Stop
-                }
+                ServiceLifecycle::Stopping { .. }
+                | ServiceLifecycle::Stopped { .. }
+                | ServiceLifecycle::StoppedByUser { .. } => VisualBadge::Stop,
             },
             Self::Repl(repl) => match repl {
                 ReplLifecycle::Starting { .. } | ReplLifecycle::Busy { .. } => VisualBadge::Run,

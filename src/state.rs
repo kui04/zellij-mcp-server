@@ -41,7 +41,6 @@ pub struct ManagedRecord {
     pub placement: ResolvedPlacement,
     pub cmd: CommandSpec,
     pub cwd: PathBuf,
-    pub env: Vec<(String, String)>,
     pub ready_pattern: Option<CompiledPattern>,
     pub prompt_pattern: Option<CompiledPattern>,
     pub lifecycle: EntityLifecycle,
@@ -122,6 +121,7 @@ pub enum ZellijEvent {
 #[derive(Debug)]
 pub struct StateStore {
     pub layout: LayoutState,
+    pub session_dead: bool,
     panes_by_key: HashMap<ManagedKey, ManagedRecord>,
     key_by_pane_id: HashMap<TerminalPaneId, ManagedKey>,
     early_exits: HashMap<TerminalPaneId, Option<i32>>,
@@ -134,6 +134,7 @@ impl StateStore {
     pub fn new(session: SessionName) -> Self {
         Self {
             layout: LayoutState::new(session),
+            session_dead: false,
             panes_by_key: HashMap::new(),
             key_by_pane_id: HashMap::new(),
             early_exits: HashMap::new(),
@@ -344,6 +345,20 @@ impl StateStore {
                         effects.changed_keys.push(key);
                         effects.subscription_dirty = true;
                     }
+                    EntityLifecycle::Service(ServiceLifecycle::Stopping { started_at }) => {
+                        let started_at = *started_at;
+                        record.lifecycle = EntityLifecycle::Service(ServiceLifecycle::Stopped {
+                            started_at,
+                            ended_at: now,
+                        });
+                        let title = format_record_title(record);
+                        record.pane_title = title.clone();
+                        effects
+                            .visual_actions
+                            .push(VisualAction::RenamePane { pane_id, title });
+                        effects.changed_keys.push(key);
+                        effects.subscription_dirty = true;
+                    }
                     EntityLifecycle::Service(
                         ServiceLifecycle::Failed { .. }
                         | ServiceLifecycle::Stopped { .. }
@@ -386,8 +401,10 @@ impl StateStore {
                 let Some(record) = self.panes_by_key.get_mut(&key) else {
                     return effects;
                 };
-                if let EntityLifecycle::Task(TaskLifecycle::Completed { pane_closed, .. }) =
-                    &mut record.lifecycle
+                if let EntityLifecycle::Task(
+                    TaskLifecycle::Completed { pane_closed, .. }
+                    | TaskLifecycle::Cancelled { pane_closed, .. },
+                ) = &mut record.lifecycle
                 {
                     *pane_closed = true;
                 }
@@ -396,6 +413,12 @@ impl StateStore {
                         EntityLifecycle::Task(t) => {
                             EntityLifecycle::Task(TaskLifecycle::StoppedByUser {
                                 started_at: t.started_at(),
+                                ended_at: now,
+                            })
+                        }
+                        EntityLifecycle::Service(ServiceLifecycle::Stopping { started_at }) => {
+                            EntityLifecycle::Service(ServiceLifecycle::Stopped {
+                                started_at: *started_at,
                                 ended_at: now,
                             })
                         }
@@ -429,6 +452,7 @@ impl StateStore {
                 let _ = self.layout.tab_modes.remove(&tab_id);
             }
             ZellijEvent::SessionEnding => {
+                self.session_dead = true;
                 effects.subscription_dirty = true;
             }
         }
@@ -485,7 +509,7 @@ impl StateStore {
             }
             EntityLifecycle::Repl(ReplLifecycle::InputRequired { started_at, .. }) => {
                 let recovered = match &record.prompt_pattern {
-                    Some(pat) => delta.iter().any(|line| pat.is_match(line)),
+                    Some(pat) => delta.iter().any(|line| pat.matches_terminal_line(line)),
                     None => true,
                 };
                 if recovered {
@@ -507,6 +531,7 @@ impl StateStore {
                     ..
                 }
                 | ServiceLifecycle::Ready { .. }
+                | ServiceLifecycle::Stopping { .. }
                 | ServiceLifecycle::Failed { .. }
                 | ServiceLifecycle::Stopped { .. }
                 | ServiceLifecycle::StoppedByUser { .. },
@@ -530,6 +555,7 @@ impl StateStore {
         now: SystemTime,
     ) -> TransitionEffects {
         let mut effects = TransitionEffects::default();
+        self.session_dead = false;
 
         let live_tab_ids: HashSet<TabId> = snapshot.tabs.iter().map(|t| t.tab_id).collect();
         self.layout
@@ -703,7 +729,6 @@ impl StateStore {
                 placement,
                 cmd,
                 cwd: pane.cwd.unwrap_or_else(|| PathBuf::from(".")),
-                env: Vec::new(),
                 ready_pattern: None,
                 prompt_pattern: None,
                 lifecycle,

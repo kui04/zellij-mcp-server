@@ -28,6 +28,10 @@ struct Cli {
     /// Gate destructive tools (`task_cancel`, `service_stop`, `repl_close`) with `zellij prompt confirm`.
     #[arg(long, default_value_t = false)]
     confirm_destructive: bool,
+
+    /// Keep a server-created Zellij session alive when the MCP server exits.
+    #[arg(long, default_value_t = false)]
+    keep_session: bool,
 }
 
 #[tokio::main]
@@ -71,6 +75,7 @@ async fn main() -> Result<()> {
         OrchestratorConfig {
             session_resolution,
             confirm_destructive: cli.confirm_destructive,
+            keep_session: cli.keep_session,
             default_cwd,
         },
         client,
@@ -89,7 +94,7 @@ async fn main() -> Result<()> {
             let _ = res;
         }
         _ = tokio::signal::ctrl_c() => {
-            info!("received ctrl-c; shutting down streams without touching Zellij session");
+            info!("received ctrl-c; shutting down");
         }
     }
 
