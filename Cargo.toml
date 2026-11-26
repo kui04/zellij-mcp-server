@@ -1,6 +1,6 @@
 [package]
 name = "zellij-mcp-server"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Asynchronous Zellij-backed terminal orchestration MCP server over stdio"
 repository = "https://github.com/kui04/zellij-mcp-server"
