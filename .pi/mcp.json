@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "zellij": {
+      "command": "cargo",
+      "args": ["run", "--quiet", "--"],
+      "cwd": ".",
+      "env": {
+        "RUST_LOG": "zellij_mcp_server=debug"
+      },
+      "timeout": 180,
+      "description": "Local zellij-mcp-server build under test. Inherits $ZELLIJ_SESSION_NAME when running inside Zellij; otherwise creates a fresh session and cleans it up on disconnect."
+    }
+  }
+}
