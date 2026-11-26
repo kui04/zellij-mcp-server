@@ -23,15 +23,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
       - name: Install nightly rustfmt
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
@@ -40,7 +40,7 @@ jobs:
         run: cargo +nightly fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo +stable clippy --all-targets --all-features -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -81,9 +81,10 @@ jobs:
           base_url="https://github.com/zellij-org/zellij/releases/download/v0.46.1"
           curl -fsSL "$base_url/$archive" -o "$RUNNER_TEMP/$archive"
           curl -fsSL "$base_url/zellij-${{ matrix.zellij_target }}.sha256sum" -o "$RUNNER_TEMP/zellij.sha256sum"
-          (cd "$RUNNER_TEMP" && sha256sum -c zellij.sha256sum)
           mkdir -p "$RUNNER_TEMP/zellij-bin"
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/zellij-bin"
+          expected_hash="$(awk '{print $1}' "$RUNNER_TEMP/zellij.sha256sum")"
+          echo "$expected_hash  $RUNNER_TEMP/zellij-bin/zellij" | sha256sum -c -
           echo "$RUNNER_TEMP/zellij-bin" >> "$GITHUB_PATH"
 
       - name: Run full test suite (including real Zellij E2E)
