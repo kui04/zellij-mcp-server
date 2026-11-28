@@ -1,5 +1,10 @@
 //! CLI entrypoint for `zellij-mcp-server` (stdio MCP transport only).
 
+#![forbid(unsafe_code)]
+#![deny(unreachable_patterns)]
+#![warn(clippy::all)]
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
