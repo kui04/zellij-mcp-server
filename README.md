@@ -142,8 +142,9 @@ Add `zellij-mcp-server` to your MCP client configuration (for example `.pi/mcp.j
 - `split_down`
 - `floating`
 - `stacked` (falls back to `floating` in headless sessions when no terminal client is attached)
-- `background_tab` (routes tasks to `agent:tasks` and services to `agent:services`; falls back to
-  `floating` in headless sessions with 0 attached clients)
+- `background_tab` (routes tasks to `agent:tasks` and services to `agent:services`, closing the
+  default shell pane of a fresh tab once the first managed pane exists; falls back to `floating` in
+  headless sessions with 0 attached clients)
 
 Layout tiers reported by `workspace_status.viewport.layout_tier`:
 

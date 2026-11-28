@@ -22,7 +22,10 @@ use zellij_mcp_server::domain::lifecycle::{
 use zellij_mcp_server::logs::{
     BoundedLogBuffer, diff_viewport, filter_and_tail_lines, strip_ansi, truncate_head_tail,
 };
-use zellij_mcp_server::state::{ManagedRecord, ReconciliationSnapshot, StateStore, ZellijEvent};
+use zellij_mcp_server::runtime::{FreshManagedTab, PlaceholderPaneId};
+use zellij_mcp_server::state::{
+    ManagedRecord, ObservedPane, ReconciliationSnapshot, StateStore, ZellijEvent,
+};
 use zellij_mcp_server::zellij::protocol::{
     is_active_session_in_list, is_session_not_found_stderr, parse_event_line,
     parse_list_panes_json, parse_list_tabs_json, parse_new_pane_output, parse_new_tab_output,
@@ -728,4 +731,93 @@ fn regression_dead_session_detection_prompt_whitespace_tail_lines_and_stopping_s
         Some("stopped")
     );
     Ok(())
+}
+
+#[test]
+fn placeholder_panes_and_cleanup_receipt_enforce_spawn_ordering() -> Result<()> {
+    let fresh_tab = TabId::new(4);
+    let panes = vec![
+        obs_pane(TerminalPaneId::new(10), fresh_tab, "Shell", false),
+        obs_pane(
+            TerminalPaneId::new(11),
+            fresh_tab,
+            "[RUN] mcp:task:t_01:job",
+            false,
+        ),
+        obs_pane(TerminalPaneId::new(12), fresh_tab, "floating-shell", true),
+        obs_pane(
+            TerminalPaneId::new(13),
+            TabId::new(5),
+            "other-tab-shell",
+            false,
+        ),
+    ];
+
+    // Only untitled tiled panes of the fresh tab are placeholders.
+    let placeholders = PlaceholderPaneId::collect_from_fresh_tab(fresh_tab, &panes);
+    assert_eq!(placeholders.len(), 1);
+    assert_eq!(
+        placeholders[0].as_terminal_pane_id(),
+        TerminalPaneId::new(10)
+    );
+
+    // A spawn redirected to another tab yields no receipt, so placeholders are never closed.
+    let fresh = FreshManagedTab::new(fresh_tab, placeholders);
+    assert!(
+        fresh
+            .into_cleanup_receipt(Some(TabId::new(5)), TerminalPaneId::new(20))
+            .is_none()
+    );
+
+    // A spawn without a target tab cannot prove it landed in the fresh tab either.
+    let placeholders = PlaceholderPaneId::collect_from_fresh_tab(fresh_tab, &panes);
+    let fresh = FreshManagedTab::new(fresh_tab, placeholders);
+    assert!(
+        fresh
+            .into_cleanup_receipt(None, TerminalPaneId::new(20))
+            .is_none()
+    );
+
+    // A managed pane in the fresh tab yields the receipt for the placeholder only.
+    let placeholders = PlaceholderPaneId::collect_from_fresh_tab(fresh_tab, &panes);
+    let receipt = FreshManagedTab::new(fresh_tab, placeholders)
+        .into_cleanup_receipt(Some(fresh_tab), TerminalPaneId::new(20));
+    let Some(receipt) = receipt else {
+        panic!("expected cleanup receipt");
+    };
+    assert_eq!(receipt.tab_id(), fresh_tab);
+    assert_eq!(receipt.spawned_pane(), TerminalPaneId::new(20));
+    assert_eq!(receipt.placeholders().len(), 1);
+
+    // Defensive filter: a spawned pane that is also listed as a placeholder is never closed.
+    let placeholders = PlaceholderPaneId::collect_from_fresh_tab(fresh_tab, &panes);
+    let receipt = FreshManagedTab::new(fresh_tab, placeholders)
+        .into_cleanup_receipt(Some(fresh_tab), TerminalPaneId::new(10));
+    let Some(receipt) = receipt else {
+        panic!("expected cleanup receipt");
+    };
+    assert!(receipt.placeholders().is_empty());
+    Ok(())
+}
+
+/// Builds an observed pane for placeholder filtering tests.
+fn obs_pane(
+    pane_id: TerminalPaneId,
+    tab_id: TabId,
+    title: &str,
+    is_floating: bool,
+) -> ObservedPane {
+    ObservedPane {
+        pane_id,
+        tab_id,
+        title: title.to_owned(),
+        is_focused: false,
+        is_floating,
+        columns: 80,
+        rows: 24,
+        exited: false,
+        exit_status: None,
+        cwd: None,
+        command: None,
+    }
 }

@@ -9,7 +9,7 @@ use anyhow::Result;
 use zellij_mcp_server::domain::error::DomainError;
 use zellij_mcp_server::domain::ids::{
     CommandSpec, CompiledPattern, EnterPolicy, PaneClosePolicy, ReplInput, ReplName, ServiceName,
-    SessionName, SessionResolution, TerminalPaneId, WaitMode,
+    SessionName, SessionResolution, TabId, TerminalPaneId, WaitMode,
 };
 use zellij_mcp_server::domain::layout::{LayoutConstraints, PlacementRequest, ResolvedPlacement};
 use zellij_mcp_server::runtime::{
@@ -96,7 +96,6 @@ async fn task_run_fast_and_slow_paths_with_task_wait() -> Result<()> {
     }
 
     // Slow path: exceeds wait_timeout, then finishes while task_wait blocks.
-    ctrl.set_screen_dump(TerminalPaneId::new(2), "tests passed");
     let (slow, _) = orch
         .task_run(TaskRunRequest {
             cmd: CommandSpec::parse(vec!["cargo".into(), "test".into()])?,
@@ -107,17 +106,20 @@ async fn task_run_fast_and_slow_paths_with_task_wait() -> Result<()> {
         })
         .await?;
 
-    let slow_id = match slow {
-        TaskRunOutcome::Running { task_id, .. } => task_id,
+    let (slow_id, slow_pane) = match slow {
+        TaskRunOutcome::Running {
+            task_id, pane_id, ..
+        } => (task_id, pane_id),
         TaskRunOutcome::Completed { .. } => panic!("expected slow-path running"),
     };
 
+    ctrl.set_screen_dump(slow_pane, "tests passed");
     let orch_bg = orch.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(30)).await;
         orch_bg
             .inject_event(ZellijEvent::PaneExited {
-                pane_id: TerminalPaneId::new(2),
+                pane_id: slow_pane,
                 exit_code: Some(0),
             })
             .await;
@@ -134,15 +136,19 @@ async fn task_run_fast_and_slow_paths_with_task_wait() -> Result<()> {
 
 #[tokio::test]
 async fn service_start_idempotent_readiness_incremental_logs_and_crash_alert() -> Result<()> {
-    let (orch, _ctrl) = make_orchestrator("mock-svc", false)?;
+    let (orch, ctrl) = make_orchestrator("mock-svc", false)?;
     orch.initialize().await?;
 
+    let bg_ctrl = ctrl.clone();
     let orch_bg = orch.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(30)).await;
+        let Some(pane_id) = bg_ctrl.find_pane_id_by_title("mcp:svc:web-dev") else {
+            return;
+        };
         orch_bg
             .inject_viewport_frame(SubscribeFrame {
-                pane_id: TerminalPaneId::new(1),
+                pane_id,
                 is_initial: false,
                 viewport_lines: vec!["booting...".into(), "Local: http://localhost:5173".into()],
             })
@@ -450,12 +456,16 @@ async fn dead_session_errors_propagate_across_all_tools() -> Result<()> {
         .await?;
 
     let repl_name = ReplName::parse("py")?;
+    let bg_ctrl = ctrl.clone();
     let orch_bg = orch.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(10)).await;
+        let Some(pane_id) = bg_ctrl.find_pane_id_by_title("mcp:repl:py") else {
+            return;
+        };
         orch_bg
             .inject_viewport_frame(SubscribeFrame {
-                pane_id: TerminalPaneId::new(3),
+                pane_id,
                 is_initial: false,
                 viewport_lines: vec![">>>".into()],
             })
@@ -708,7 +718,6 @@ async fn failed_task_logs_survive_external_close_and_instant_exit_captures_outpu
 
     // 3. Slow async task exiting via PaneExited and then closed externally before task_logs still
     //    preserves backfilled output.
-    ctrl.set_screen_dump(TerminalPaneId::new(3), "slow-bg-line-1\nslow-bg-line-2");
     let (slow, _) = orch
         .task_run(TaskRunRequest {
             cmd: CommandSpec::parse(vec!["sleep".into(), "1".into()])?,
@@ -718,19 +727,20 @@ async fn failed_task_logs_survive_external_close_and_instant_exit_captures_outpu
             placement: PlacementRequest::BackgroundTab,
         })
         .await?;
-    let slow_id = match slow {
-        TaskRunOutcome::Running { task_id, .. } => task_id,
+    let (slow_id, slow_pane) = match slow {
+        TaskRunOutcome::Running {
+            task_id, pane_id, ..
+        } => (task_id, pane_id),
         TaskRunOutcome::Completed { .. } => panic!("expected running"),
     };
+    ctrl.set_screen_dump(slow_pane, "slow-bg-line-1\nslow-bg-line-2");
     orch.inject_event(ZellijEvent::PaneExited {
-        pane_id: TerminalPaneId::new(3),
+        pane_id: slow_pane,
         exit_code: Some(1),
     })
     .await;
-    orch.inject_event(ZellijEvent::PaneClosed {
-        pane_id: TerminalPaneId::new(3),
-    })
-    .await;
+    orch.inject_event(ZellijEvent::PaneClosed { pane_id: slow_pane })
+        .await;
     let (slow_logs, _) = orch.task_logs(&slow_id, 20, None).await?;
     assert!(slow_logs.pane_closed);
     assert!(slow_logs.output.contains("slow-bg-line-2"));
@@ -752,5 +762,89 @@ async fn failed_task_logs_survive_external_close_and_instant_exit_captures_outpu
         cwd_err.downcast_ref::<DomainError>(),
         Some(DomainError::InvalidCwd { .. })
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn background_task_replaces_default_shell_pane_with_managed_pane() -> Result<()> {
+    let (orch, ctrl) = make_orchestrator("mock-placeholder", false)?;
+    orch.initialize().await?;
+
+    let (running, _) = orch
+        .task_run(TaskRunRequest {
+            cmd: CommandSpec::parse(vec!["sleep".into(), "60".into()])?,
+            cwd: None,
+            name: Some("bg".into()),
+            wait_timeout: Duration::from_millis(10),
+            placement: PlacementRequest::BackgroundTab,
+        })
+        .await?;
+
+    let (pane_id, tab_id) = match running {
+        TaskRunOutcome::Running {
+            pane_id,
+            tab_id,
+            tab_name,
+            ..
+        } => {
+            assert_eq!(tab_name.as_deref(), Some("agent:tasks"));
+            (pane_id, tab_id)
+        }
+        TaskRunOutcome::Completed { .. } => panic!("expected running"),
+    };
+
+    let panes = ctrl.panes_in_tab(tab_id);
+    assert_eq!(
+        panes.len(),
+        1,
+        "fresh managed tab must hold only the managed pane, got: {panes:?}"
+    );
+    assert_eq!(panes[0].pane_id, pane_id);
+    assert!(
+        ctrl.recorded_actions()
+            .iter()
+            .any(|action| action.starts_with("close_pane:")),
+        "expected the default shell placeholder to be closed, got: {:?}",
+        ctrl.recorded_actions()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_spawn_never_closes_the_fresh_tab_placeholder() -> Result<()> {
+    let (orch, ctrl) = make_orchestrator("mock-placeholder-fail", false)?;
+    orch.initialize().await?;
+    ctrl.set_fail_new_pane(true);
+
+    let err = orch
+        .task_run(TaskRunRequest {
+            cmd: CommandSpec::parse(vec!["sleep".into(), "60".into()])?,
+            cwd: None,
+            name: Some("bg".into()),
+            wait_timeout: Duration::from_millis(10),
+            placement: PlacementRequest::BackgroundTab,
+        })
+        .await
+        .err();
+    assert!(
+        err.is_some(),
+        "expected the failed spawn to surface an error"
+    );
+
+    let panes = ctrl.panes_in_tab(TabId::new(1));
+    assert_eq!(
+        panes.len(),
+        1,
+        "a failed spawn must leave the placeholder pane open, got: {panes:?}"
+    );
+    assert_eq!(panes[0].title, "Shell");
+    assert!(
+        !ctrl
+            .recorded_actions()
+            .iter()
+            .any(|action| action.starts_with("close_pane:")),
+        "a failed spawn must never issue close-pane, got: {:?}",
+        ctrl.recorded_actions()
+    );
     Ok(())
 }

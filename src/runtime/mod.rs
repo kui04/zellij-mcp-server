@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::Result;
 use regex::Regex;
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::domain::error::DomainError;
 use crate::domain::ids::{
@@ -32,7 +32,7 @@ use crate::logs::{
 };
 use crate::runtime::cache::{CachedPaneEntry, SessionCache, load_cache, remove_cache, save_cache};
 use crate::state::{
-    ManagedRecord, ReconciliationSnapshot, StateStore, TransitionEffects, ZellijEvent,
+    ManagedRecord, ObservedPane, ReconciliationSnapshot, StateStore, TransitionEffects, ZellijEvent,
 };
 use crate::zellij::cli::{NewPaneSpec, SessionAttachment, ZellijClient};
 use crate::zellij::protocol::SubscribeFrame;
@@ -254,6 +254,114 @@ struct SpawnedPane {
     pane_id: TerminalPaneId,
     placement: ResolvedPlacement,
     layout_hint: Option<String>,
+}
+
+/// Pane that Zellij created on its own when materializing a fresh managed tab.
+///
+/// Kept distinct from [`TerminalPaneId`] so the managed spawn, log, and close paths cannot target
+/// it by accident: it is only ever closed through [`PlaceholderCleanupReceipt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PlaceholderPaneId(TerminalPaneId);
+
+impl PlaceholderPaneId {
+    /// Boundary filter for a freshly created tab: keeps tiled panes whose title carries no
+    /// managed key. Panes titled by `PaneTitleCodec` belong to a managed record and are never
+    /// placeholders.
+    pub fn collect_from_fresh_tab(tab_id: TabId, panes: &[ObservedPane]) -> Vec<Self> {
+        panes
+            .iter()
+            .filter(|pane| {
+                pane.tab_id == tab_id
+                    && !pane.is_floating
+                    && PaneTitleCodec::parse(&pane.title).is_none()
+            })
+            .map(|pane| Self(pane.pane_id))
+            .collect()
+    }
+
+    pub const fn as_terminal_pane_id(self) -> TerminalPaneId {
+        self.0
+    }
+}
+
+/// Phase 1 of a fresh managed tab: it holds only Zellij-created placeholder panes.
+///
+/// The only way to obtain a [`PlaceholderCleanupReceipt`] consumes `self`, so the code cannot
+/// close the placeholder first and then spawn: closing the last pane of a tab destroys the tab.
+#[derive(Debug)]
+pub struct FreshManagedTab {
+    tab_id: TabId,
+    placeholders: Vec<PlaceholderPaneId>,
+}
+
+impl FreshManagedTab {
+    pub fn new(tab_id: TabId, placeholders: Vec<PlaceholderPaneId>) -> Self {
+        Self {
+            tab_id,
+            placeholders,
+        }
+    }
+
+    pub const fn tab_id(&self) -> TabId {
+        self.tab_id
+    }
+
+    /// Consumes the fresh tab and yields a receipt only when the managed pane landed in this tab.
+    ///
+    /// Returns `None` when the spawn was redirected to another tab: the placeholders are then
+    /// left alone instead of destroying a tab that no managed pane backs.
+    pub fn into_cleanup_receipt(
+        self,
+        spawned_in_tab: Option<TabId>,
+        spawned_pane: TerminalPaneId,
+    ) -> Option<PlaceholderCleanupReceipt> {
+        if spawned_in_tab != Some(self.tab_id) {
+            return None;
+        }
+        let placeholders = self
+            .placeholders
+            .into_iter()
+            .filter(|placeholder| placeholder.0 != spawned_pane)
+            .collect();
+        Some(PlaceholderCleanupReceipt {
+            tab_id: self.tab_id,
+            spawned_pane,
+            placeholders,
+        })
+    }
+}
+
+/// Phase 2 of a fresh managed tab: proof that a managed pane exists in `tab_id` right now.
+#[derive(Debug)]
+pub struct PlaceholderCleanupReceipt {
+    tab_id: TabId,
+    spawned_pane: TerminalPaneId,
+    placeholders: Vec<PlaceholderPaneId>,
+}
+
+impl PlaceholderCleanupReceipt {
+    pub const fn tab_id(&self) -> TabId {
+        self.tab_id
+    }
+
+    pub const fn spawned_pane(&self) -> TerminalPaneId {
+        self.spawned_pane
+    }
+
+    pub fn placeholders(&self) -> &[PlaceholderPaneId] {
+        &self.placeholders
+    }
+}
+
+/// Target tab after provisioning; replaces the ambiguous `(Option<TabId>, bool)` pair.
+#[derive(Debug)]
+pub enum ProvisionedTab {
+    /// Tab already existed (active tab or a previously created managed tab).
+    Existing { tab_id: Option<TabId> },
+    /// Tab was just created and still contains Zellij-created placeholder panes.
+    Fresh(FreshManagedTab),
+    /// Headless session refused to materialize a new tab; caller falls back to the active tab.
+    HeadlessFallback { active_tab_id: Option<TabId> },
 }
 
 impl WorkspaceOrchestrator {
@@ -548,13 +656,15 @@ impl WorkspaceOrchestrator {
         Ok(())
     }
 
-    async fn provision_target_tab(&self, target: TargetTab) -> Result<(Option<TabId>, bool)> {
+    async fn provision_target_tab(&self, target: TargetTab) -> Result<ProvisionedTab> {
         match target {
-            TargetTab::ActiveTab(id) => Ok((id, false)),
+            TargetTab::ActiveTab(id) => Ok(ProvisionedTab::Existing { tab_id: id }),
             TargetTab::ManagedTab {
                 kind: _,
                 existing: Some(tab_id),
-            } => Ok((Some(tab_id), false)),
+            } => Ok(ProvisionedTab::Existing {
+                tab_id: Some(tab_id),
+            }),
             TargetTab::ManagedTab {
                 kind: tab_kind,
                 existing: None,
@@ -564,14 +674,27 @@ impl WorkspaceOrchestrator {
                 // Verify via `list-tabs` and fall back cleanly to the existing tab if absent.
                 let maybe_created = match self.inner.client.new_tab(tab_kind.tab_name()).await {
                     Ok(created) => {
-                        let materialized = self
-                            .inner
-                            .client
-                            .list_tabs()
-                            .await
-                            .map(|tabs| tabs.iter().any(|t| t.tab_id == created))
-                            .unwrap_or(false);
-                        if materialized { Some(created) } else { None }
+                        match tokio::try_join!(
+                            self.inner.client.list_tabs(),
+                            self.inner.client.list_panes(),
+                        ) {
+                            Ok((tabs, panes)) if tabs.iter().any(|tab| tab.tab_id == created) => {
+                                Some((created, panes))
+                            }
+                            Ok(_) => None,
+                            Err(err) if is_session_not_found(&err) => {
+                                self.mark_session_dead().await;
+                                return Err(err);
+                            }
+                            Err(err) => {
+                                warn!(
+                                    tab = tab_kind.tab_name(),
+                                    error = %err,
+                                    "post new-tab listing failed; falling back to active tab"
+                                );
+                                None
+                            }
+                        }
                     }
                     Err(err) if is_session_not_found(&err) => {
                         self.mark_session_dead().await;
@@ -586,7 +709,8 @@ impl WorkspaceOrchestrator {
                         None
                     }
                 };
-                if let Some(created) = maybe_created {
+                if let Some((created, panes)) = maybe_created {
+                    let placeholders = PlaceholderPaneId::collect_from_fresh_tab(created, &panes);
                     let mut store = self.inner.state.write().await;
                     match tab_kind {
                         ManagedTabKind::Tasks => store.layout.managed_tabs.tasks = Some(created),
@@ -594,11 +718,60 @@ impl WorkspaceOrchestrator {
                             store.layout.managed_tabs.services = Some(created)
                         }
                     }
-                    Ok((Some(created), false))
+                    Ok(ProvisionedTab::Fresh(FreshManagedTab::new(
+                        created,
+                        placeholders,
+                    )))
                 } else {
                     let store = self.inner.state.read().await;
-                    Ok((store.layout.active_tab_id, true))
+                    Ok(ProvisionedTab::HeadlessFallback {
+                        active_tab_id: store.layout.active_tab_id,
+                    })
                 }
+            }
+        }
+    }
+
+    /// Spawns a managed pane, then clears the placeholder panes of a freshly provisioned tab.
+    ///
+    /// The fresh tab is left untouched on error: closing its last pane would destroy the tab.
+    async fn spawn_managed_pane(
+        &self,
+        spec: &NewPaneSpec,
+        fresh_tab: &mut Option<FreshManagedTab>,
+    ) -> Result<TerminalPaneId> {
+        let pane_id = self.inner.client.new_pane(spec).await?;
+        let Some(fresh) = fresh_tab.take() else {
+            return Ok(pane_id);
+        };
+        match fresh.into_cleanup_receipt(spec.tab_id, pane_id) {
+            Some(receipt) => self.close_placeholder_panes(receipt).await,
+            None => warn!(
+                spawned_tab = ?spec.tab_id,
+                pane_id = %pane_id,
+                "managed pane spawned outside the freshly provisioned tab; keeping its placeholders"
+            ),
+        }
+        Ok(pane_id)
+    }
+
+    /// Closes Zellij-created placeholder panes; a pane already closed by the human is not fatal.
+    async fn close_placeholder_panes(&self, receipt: PlaceholderCleanupReceipt) {
+        for placeholder in receipt.placeholders() {
+            let pane_id = placeholder.as_terminal_pane_id();
+            if let Err(err) = self
+                .inner
+                .client
+                .apply_visual_action(&VisualAction::ClosePane { pane_id })
+                .await
+            {
+                debug!(
+                    tab_id = %receipt.tab_id(),
+                    pane_id = %pane_id,
+                    spawned_pane = %receipt.spawned_pane(),
+                    error = %err,
+                    "placeholder pane cleanup failed; it was already closed or no longer exists"
+                );
             }
         }
     }
@@ -643,8 +816,12 @@ impl WorkspaceOrchestrator {
             )
         };
 
-        let (mut target_tab_id, mut tab_fell_back) =
-            self.provision_target_tab(plan.target_tab).await?;
+        let (mut target_tab_id, mut tab_fell_back, mut fresh_tab) =
+            match self.provision_target_tab(plan.target_tab).await? {
+                ProvisionedTab::Existing { tab_id } => (tab_id, false, None),
+                ProvisionedTab::Fresh(fresh) => (Some(fresh.tab_id()), false, Some(fresh)),
+                ProvisionedTab::HeadlessFallback { active_tab_id } => (active_tab_id, true, None),
+            };
 
         // When `background_tab` could not materialize a new tab in a headless session (0 attached
         // clients), fall back immediately to a floating pane instead of silently splitting the
@@ -678,7 +855,7 @@ impl WorkspaceOrchestrator {
             cmd: cmd.clone(),
         };
 
-        let pane_id = match self.inner.client.new_pane(&initial_spec).await {
+        let pane_id = match self.spawn_managed_pane(&initial_spec, &mut fresh_tab).await {
             Ok(id) => id,
             Err(err) if is_session_not_found(&err) => {
                 self.mark_session_dead().await;
@@ -719,11 +896,28 @@ impl WorkspaceOrchestrator {
                         reason,
                     )
                 };
-                let (fb_tab_id, fb_tab_fell_back) =
-                    self.provision_target_tab(fb_plan.target_tab).await?;
-                target_tab_id = fb_tab_id;
-                tab_fell_back = fb_tab_fell_back;
-                effective_placement = if fb_tab_fell_back {
+                let fb_provisioned = self.provision_target_tab(fb_plan.target_tab).await?;
+                match fb_provisioned {
+                    ProvisionedTab::Existing { tab_id } => {
+                        target_tab_id = tab_id;
+                        tab_fell_back = false;
+                    }
+                    ProvisionedTab::Fresh(fb_fresh) => {
+                        target_tab_id = Some(fb_fresh.tab_id());
+                        tab_fell_back = false;
+                        if let Some(unused) = fresh_tab.replace(fb_fresh) {
+                            warn!(
+                                unused_tab = %unused.tab_id(),
+                                "provisioned a second fresh tab; leaving its placeholder panes open"
+                            );
+                        }
+                    }
+                    ProvisionedTab::HeadlessFallback { active_tab_id } => {
+                        target_tab_id = active_tab_id;
+                        tab_fell_back = true;
+                    }
+                }
+                effective_placement = if tab_fell_back {
                     ResolvedPlacement::Floating
                 } else {
                     fb_plan.placement
@@ -734,7 +928,7 @@ impl WorkspaceOrchestrator {
                     tab_id: target_tab_id,
                     name: pane_title,
                     placement: effective_placement,
-                    stacked: if fb_tab_fell_back {
+                    stacked: if tab_fell_back {
                         false
                     } else {
                         fb_plan.open_stacked
@@ -742,7 +936,7 @@ impl WorkspaceOrchestrator {
                     cwd: Some(cwd),
                     cmd,
                 };
-                match self.inner.client.new_pane(&fb_spec).await {
+                match self.spawn_managed_pane(&fb_spec, &mut fresh_tab).await {
                     Ok(id) => id,
                     Err(fb_err) => {
                         if is_session_not_found(&fb_err) {
@@ -776,7 +970,10 @@ impl WorkspaceOrchestrator {
                     cwd: Some(cwd),
                     cmd,
                 };
-                match self.inner.client.new_pane(&fallback_spec).await {
+                match self
+                    .spawn_managed_pane(&fallback_spec, &mut fresh_tab)
+                    .await
+                {
                     Ok(id) => id,
                     Err(fb_err) => {
                         if is_session_not_found(&fb_err) {

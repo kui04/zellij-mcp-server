@@ -643,6 +643,9 @@ impl ZellijClient {
             ZellijBackend::Mock(ctrl) => {
                 ctrl.ensure_alive()?;
                 ctrl.record(&format!("visual:{action:?}"));
+                if let VisualAction::ClosePane { pane_id } = action {
+                    ctrl.mock_remove_pane(*pane_id);
+                }
                 Ok(())
             }
         }
@@ -721,6 +724,7 @@ pub mod mock {
         session_preexisting: bool,
         fail_stacked: bool,
         fail_no_room: bool,
+        fail_new_pane: bool,
         recorded_actions: Vec<String>,
     }
 
@@ -759,6 +763,7 @@ pub mod mock {
                         session_preexisting: false,
                         fail_stacked: false,
                         fail_no_room: false,
+                        fail_new_pane: false,
                         recorded_actions: Vec::new(),
                     }),
                 }),
@@ -802,6 +807,12 @@ pub mod mock {
 
         pub fn set_fail_no_room(&self, fail: bool) {
             self.lock_state().fail_no_room = fail;
+        }
+
+        /// Makes every `new-pane` call fail, exercising spawn-failure paths. Limits: applies to
+        /// all placements until cleared.
+        pub fn set_fail_new_pane(&self, fail: bool) {
+            self.lock_state().fail_new_pane = fail;
         }
 
         pub fn set_focused_pane_geometry(&self, columns: u16, rows: u16) {
@@ -874,13 +885,62 @@ pub mod mock {
                 active: false,
                 viewport,
             });
+            // Zellij materializes every new tab with one default shell pane that no managed
+            // record owns; the orchestrator must close it after spawning its first pane.
+            let placeholder_id = TerminalPaneId::new(state.next_pane_id);
+            state.next_pane_id += 1;
+            state.panes.push(ObservedPane {
+                pane_id: placeholder_id,
+                tab_id,
+                title: "Shell".to_owned(),
+                is_focused: false,
+                is_floating: false,
+                columns: viewport.columns,
+                rows: viewport.rows,
+                exited: false,
+                exit_status: None,
+                cwd: None,
+                command: None,
+            });
             state.recorded_actions.push(format!("new_tab:{name}"));
             Ok(tab_id)
+        }
+
+        /// Removes a pane the way `zellij action close-pane` does.
+        pub(crate) fn mock_remove_pane(&self, pane_id: TerminalPaneId) {
+            let mut state = self.lock_state();
+            state.panes.retain(|pane| pane.pane_id != pane_id);
+            state.recorded_actions.push(format!("close_pane:{pane_id}"));
+        }
+
+        /// Returns the first live pane whose title contains `needle`, mirroring `list-panes`
+        /// queries used by tests that need a pane ID before the orchestrator call returns.
+        pub fn find_pane_id_by_title(&self, needle: &str) -> Option<TerminalPaneId> {
+            self.lock_state()
+                .panes
+                .iter()
+                .find(|pane| pane.title.contains(needle))
+                .map(|pane| pane.pane_id)
+        }
+
+        /// Returns the live panes of `tab_id` (mirrors `list-panes --all`).
+        pub fn panes_in_tab(&self, tab_id: TabId) -> Vec<ObservedPane> {
+            self.lock_state()
+                .panes
+                .iter()
+                .filter(|pane| pane.tab_id == tab_id)
+                .cloned()
+                .collect()
         }
 
         pub(crate) fn mock_new_pane(&self, spec: &NewPaneSpec) -> Result<TerminalPaneId> {
             self.ensure_alive()?;
             let mut state = self.lock_state();
+            if state.fail_new_pane {
+                bail!(
+                    "zellij [\"action\", \"new-pane\"] exited with exit status: 1: stderr=new-pane failed, stdout="
+                );
+            }
             if state.fail_stacked && (spec.placement == ResolvedPlacement::Stacked || spec.stacked)
             {
                 bail!(
