@@ -347,6 +347,12 @@ impl FreshManagedTab {
             placeholders,
         })
     }
+
+    /// Returns the placeholder panes so the caller can destroy a fresh tab that no managed pane
+    /// will use. Consuming `self` keeps this distinct from the spawn-ordered receipt path.
+    pub fn into_placeholders(self) -> Vec<PlaceholderPaneId> {
+        self.placeholders
+    }
 }
 
 /// Phase 2 of a fresh managed tab: proof that a managed pane exists in `tab_id` right now.
@@ -544,13 +550,22 @@ impl WorkspaceOrchestrator {
     }
 
     async fn apply_effects(&self, effects: TransitionEffects) {
+        self.apply_effects_with(effects, true).await;
+    }
+
+    /// Executes effects; `backfill_on_close` is false when the caller already snapshotted the
+    /// scrollback, so the same pane is not dumped twice for one close.
+    async fn apply_effects_with(&self, effects: TransitionEffects, backfill_on_close: bool) {
         // Snapshot full scrollback immediately when a process exits (while its pane is still open
         // in Zellij) so logs remain available even if the pane is later closed externally.
         for pane_id in &effects.exited_panes {
             self.backfill_pane_logs_by_pane_id(*pane_id).await;
         }
         for action in &effects.visual_actions {
-            if let VisualAction::ClosePane { pane_id } = action {
+            if let VisualAction::ClosePane { pane_id } = action
+                && backfill_on_close
+                && !effects.exited_panes.contains(pane_id)
+            {
                 self.backfill_pane_logs_by_pane_id(*pane_id).await;
             }
             if let Err(err) = self.inner.client.apply_visual_action(action).await {
@@ -606,6 +621,14 @@ impl WorkspaceOrchestrator {
     }
 
     async fn reconcile_now(&self) -> Result<()> {
+        self.reconcile_now_with_retention(true).await
+    }
+
+    async fn reconcile_now_without_retention(&self) -> Result<()> {
+        self.reconcile_now_with_retention(false).await
+    }
+
+    async fn reconcile_now_with_retention(&self, apply_retention: bool) -> Result<()> {
         let joined = tokio::try_join!(
             self.inner.client.list_tabs(),
             self.inner.client.list_panes(),
@@ -622,14 +645,16 @@ impl WorkspaceOrchestrator {
         };
         let effects = {
             let mut store = self.inner.state.write().await;
-            store.reconcile(
-                ReconciliationSnapshot {
-                    tabs,
-                    panes,
-                    active_tab,
-                },
-                SystemTime::now(),
-            )
+            let snapshot = ReconciliationSnapshot {
+                tabs,
+                panes,
+                active_tab,
+            };
+            if apply_retention {
+                store.reconcile(snapshot, SystemTime::now())
+            } else {
+                store.reconcile_without_retention(snapshot, SystemTime::now())
+            }
         };
         self.apply_effects(effects).await;
         self.sync_subscriptions().await;
@@ -692,29 +717,10 @@ impl WorkspaceOrchestrator {
                 // client may return a non-materialized tab ID from `new-tab`.
                 // Verify via `list-tabs` and fall back cleanly to the existing tab if absent.
                 let maybe_created = match self.inner.client.new_tab(tab_kind.tab_name()).await {
-                    Ok(created) => {
-                        match tokio::try_join!(
-                            self.inner.client.list_tabs(),
-                            self.inner.client.list_panes(),
-                        ) {
-                            Ok((tabs, panes)) if tabs.iter().any(|tab| tab.tab_id == created) => {
-                                Some((created, panes))
-                            }
-                            Ok(_) => None,
-                            Err(err) if is_session_not_found(&err) => {
-                                self.mark_session_dead().await;
-                                return Err(err);
-                            }
-                            Err(err) => {
-                                warn!(
-                                    tab = tab_kind.tab_name(),
-                                    error = %err,
-                                    "post new-tab listing failed; falling back to active tab"
-                                );
-                                None
-                            }
-                        }
-                    }
+                    Ok(created) => self
+                        .collect_fresh_tab_panes(created, tab_kind.tab_name())
+                        .await?
+                        .map(|panes| (created, panes)),
                     Err(err) if is_session_not_found(&err) => {
                         self.mark_session_dead().await;
                         return Err(err);
@@ -751,6 +757,53 @@ impl WorkspaceOrchestrator {
         }
     }
 
+    /// Collects the panes of a just-created tab, returning `None` when the tab did not
+    /// materialize or its tab list is unavailable. An unavailable pane list only skips placeholder
+    /// cleanup; it must not discard a tab that `list-tabs` confirmed.
+    async fn collect_fresh_tab_panes(
+        &self,
+        tab_id: TabId,
+        tab_name: &str,
+    ) -> Result<Option<Vec<ObservedPane>>> {
+        let (tabs_result, panes_result) = tokio::join!(
+            self.inner.client.list_tabs(),
+            self.inner.client.list_panes(),
+        );
+        let tabs = match tabs_result {
+            Ok(tabs) => tabs,
+            Err(err) if is_session_not_found(&err) => {
+                self.mark_session_dead().await;
+                return Err(err);
+            }
+            Err(err) => {
+                warn!(
+                    tab = tab_name,
+                    error = %err,
+                    "post new-tab tab listing failed; falling back to active tab"
+                );
+                return Ok(None);
+            }
+        };
+        if !tabs.iter().any(|tab| tab.tab_id == tab_id) {
+            return Ok(None);
+        }
+        match panes_result {
+            Ok(panes) => Ok(Some(panes)),
+            Err(err) if is_session_not_found(&err) => {
+                self.mark_session_dead().await;
+                Err(err)
+            }
+            Err(err) => {
+                warn!(
+                    tab = tab_name,
+                    error = %err,
+                    "post new-tab pane listing failed; keeping the new tab without placeholder cleanup"
+                );
+                Ok(Some(Vec::new()))
+            }
+        }
+    }
+
     /// Spawns a managed pane, then clears the placeholder panes of a freshly provisioned tab.
     ///
     /// The fresh tab is left untouched on error: closing its last pane would destroy the tab.
@@ -764,7 +817,7 @@ impl WorkspaceOrchestrator {
             return Ok(pane_id);
         };
         match fresh.into_cleanup_receipt(spec.tab_id, pane_id) {
-            Some(receipt) => self.close_placeholder_panes(receipt).await,
+            Some(receipt) => self.close_placeholder_panes(receipt).await?,
             None => warn!(
                 spawned_tab = ?spec.tab_id,
                 pane_id = %pane_id,
@@ -774,9 +827,31 @@ impl WorkspaceOrchestrator {
         Ok(pane_id)
     }
 
-    /// Closes Zellij-created placeholder panes; a pane already closed by the human is not fatal.
-    async fn close_placeholder_panes(&self, receipt: PlaceholderCleanupReceipt) {
-        for placeholder in receipt.placeholders() {
+    /// Closes Zellij-created placeholder panes; a pane already closed by the human is not fatal,
+    /// while a lost session is returned so the caller aborts the spawn.
+    async fn close_placeholder_panes(&self, receipt: PlaceholderCleanupReceipt) -> Result<()> {
+        self.close_placeholder_panes_in(
+            receipt.tab_id(),
+            receipt.placeholders(),
+            Some(receipt.spawned_pane()),
+        )
+        .await
+    }
+
+    /// Destroys an abandoned fresh tab by closing its placeholders after its managed spawn failed.
+    async fn discard_fresh_tab(&self, fresh: FreshManagedTab) -> Result<()> {
+        let tab_id = fresh.tab_id();
+        self.close_placeholder_panes_in(tab_id, &fresh.into_placeholders(), None)
+            .await
+    }
+
+    async fn close_placeholder_panes_in(
+        &self,
+        tab_id: TabId,
+        placeholders: &[PlaceholderPaneId],
+        spawned_pane: Option<TerminalPaneId>,
+    ) -> Result<()> {
+        for placeholder in placeholders {
             let pane_id = placeholder.as_terminal_pane_id();
             if let Err(err) = self
                 .inner
@@ -784,15 +859,20 @@ impl WorkspaceOrchestrator {
                 .apply_visual_action(&VisualAction::ClosePane { pane_id })
                 .await
             {
+                if is_session_not_found(&err) {
+                    self.mark_session_dead().await;
+                    return Err(err);
+                }
                 debug!(
-                    tab_id = %receipt.tab_id(),
+                    tab_id = %tab_id,
                     pane_id = %pane_id,
-                    spawned_pane = %receipt.spawned_pane(),
+                    ?spawned_pane,
                     error = %err,
                     "placeholder pane cleanup failed; it was already closed or no longer exists"
                 );
             }
         }
+        Ok(())
     }
 
     async fn resolve_target_tab_and_spawn(
@@ -927,8 +1007,9 @@ impl WorkspaceOrchestrator {
                         if let Some(unused) = fresh_tab.replace(fb_fresh) {
                             warn!(
                                 unused_tab = %unused.tab_id(),
-                                "provisioned a second fresh tab; leaving its placeholder panes open"
+                                "provisioned a second fresh tab; closing its placeholder panes"
                             );
+                            self.discard_fresh_tab(unused).await?;
                         }
                     }
                     ProvisionedTab::HeadlessFallback { active_tab_id } => {
@@ -1129,14 +1210,16 @@ impl WorkspaceOrchestrator {
 
     /// Closes finished panes addressed by `request`, or previews them when it is a dry run.
     ///
-    /// Reconciles first so panes the human already closed are not selected again and do not make
-    /// the returned `closed` list claim panes that no longer exist.
+    /// Reconciles before selecting and again after closing, and both reconciliations skip
+    /// retention: a cleanup call must not close panes outside its selection (especially on a dry
+    /// run). The second reconciliation reopens records whose `close-pane` failed, so the returned
+    /// list only contains panes that are really gone.
     pub async fn workspace_cleanup(
         &self,
         request: CleanupRequest,
     ) -> Result<(CleanupOutcome, Vec<WorkspaceAlert>)> {
         self.ensure_session_alive().await?;
-        self.reconcile_now().await?;
+        self.reconcile_now_without_retention().await?;
 
         let (selected, skipped_active_count) = {
             let store = self.inner.state.read().await;
@@ -1152,19 +1235,53 @@ impl WorkspaceOrchestrator {
                 skipped_active_count,
             },
             CleanupExecutionMode::Execute => {
-                let effects = {
+                let (marked, effects) = {
                     let mut store = self.inner.state.write().await;
-                    store.mark_evicted(&selected)
+                    let effects = store.mark_evicted(&selected);
+                    let marked: Vec<EvictablePane> = selected
+                        .into_iter()
+                        .filter(|pane| effects.closed_panes.contains(&pane.pane_id()))
+                        .collect();
+                    (marked, effects)
                 };
                 self.apply_effects(effects).await;
+                let closed = self.confirm_closed_panes(marked).await?;
                 CleanupOutcome::Executed {
-                    closed: selected,
+                    closed,
                     skipped_active_count,
                 }
             }
         };
         let alerts = self.inner.state.write().await.drain_alerts();
         Ok((outcome, alerts))
+    }
+
+    /// Verifies closes against live Zellij state so the response only claims panes that are gone.
+    ///
+    /// Reconcile reopens a terminal record whose pane is still observed open, which also keeps a
+    /// failed `close-pane` retryable instead of marking it closed forever.
+    async fn confirm_closed_panes(
+        &self,
+        candidates: Vec<EvictablePane>,
+    ) -> Result<Vec<EvictablePane>> {
+        if candidates.is_empty() {
+            return Ok(candidates);
+        }
+        match self.reconcile_now_without_retention().await {
+            Ok(()) => {}
+            // The session is gone, so every candidate pane is gone as well.
+            Err(err) if is_session_not_found(&err) => return Ok(candidates),
+            Err(err) => return Err(err),
+        }
+        let store = self.inner.state.read().await;
+        Ok(candidates
+            .into_iter()
+            .filter(|pane| {
+                store
+                    .get(pane.key())
+                    .is_none_or(|record| record.lifecycle.is_pane_closed())
+            })
+            .collect())
     }
 
     pub async fn task_run(
@@ -1220,6 +1337,7 @@ impl WorkspaceOrchestrator {
                 ready_pattern: None,
                 prompt_pattern: None,
                 lifecycle: EntityLifecycle::Task(TaskLifecycle::Running { started_at: now }),
+                exit_observed: false,
                 logs: BoundedLogBuffer::default(),
                 last_viewport: Vec::new(),
             })
@@ -1260,8 +1378,11 @@ impl WorkspaceOrchestrator {
                     // Snapshot the scrollback before closing so `task_logs` keeps working.
                     let output = self.read_task_output_truncated(pane_id, &key).await;
                     if let Some(pane) = evicted {
-                        self.apply_effects(TransitionEffects::close_pane(pane.pane_id()))
-                            .await;
+                        self.apply_effects_with(
+                            TransitionEffects::close_pane(pane.pane_id()),
+                            false,
+                        )
+                        .await;
                     }
                     let alerts = self.inner.state.write().await.drain_alerts();
                     return Ok((
@@ -1495,7 +1616,7 @@ impl WorkspaceOrchestrator {
         self.maybe_confirm_destructive(&format!("Cancel task {task_id}?"))
             .await?;
 
-        let mut was_active = record.lifecycle.is_active();
+        let was_active = record.lifecycle.is_active();
         if was_active {
             let ctrl_c = vec![KeyChord::parse("Ctrl c")?];
             let lock = self.pane_write_lock(record.pane_id).await;
@@ -1530,7 +1651,20 @@ impl WorkspaceOrchestrator {
                     .wait_until_inactive(&key, Duration::from_millis(500))
                     .await;
             }
-            was_active = true;
+        }
+
+        let cancel_timed_out = was_active
+            && close_policy == PaneClosePolicy::KeepPane
+            && self
+                .inner
+                .state
+                .read()
+                .await
+                .get(&key)
+                .is_some_and(|rec| rec.lifecycle.is_active());
+        if cancel_timed_out {
+            let alerts = self.inner.state.write().await.drain_alerts();
+            return Ok(("cancel_timeout".to_owned(), alerts));
         }
 
         let mut visual_actions = Vec::new();
@@ -1746,6 +1880,7 @@ impl WorkspaceOrchestrator {
                     ready_pattern: req.ready_pattern,
                     prompt_pattern: None,
                     lifecycle,
+                    exit_observed: false,
                     logs: BoundedLogBuffer::default(),
                     last_viewport: Vec::new(),
                 })
@@ -1976,6 +2111,34 @@ impl WorkspaceOrchestrator {
             }
         }
 
+        let stop_timed_out = record.lifecycle.is_active()
+            && close_policy == PaneClosePolicy::KeepPane
+            && self
+                .inner
+                .state
+                .read()
+                .await
+                .get(&key)
+                .is_some_and(|rec| rec.lifecycle.is_active());
+        if stop_timed_out {
+            let restored = {
+                let mut store = self.inner.state.write().await;
+                if let Some(rec) = store.get_mut(&key)
+                    && rec.lifecycle.is_active()
+                {
+                    rec.lifecycle = prev_lifecycle;
+                    true
+                } else {
+                    false
+                }
+            };
+            if restored {
+                self.bump_state_gen();
+                let alerts = self.inner.state.write().await.drain_alerts();
+                return Ok(("cancel_timeout".to_owned(), alerts));
+            }
+        }
+
         let title = PaneTitleCodec::format("[STOP]", &key, None);
         let mut actions = vec![VisualAction::RenamePane {
             pane_id: record.pane_id,
@@ -2090,6 +2253,7 @@ impl WorkspaceOrchestrator {
                     ready_pattern: None,
                     prompt_pattern: req.prompt_pattern.clone(),
                     lifecycle: EntityLifecycle::Repl(ReplLifecycle::Starting { started_at: now }),
+                    exit_observed: false,
                     logs: BoundedLogBuffer::default(),
                     last_viewport: Vec::new(),
                 })

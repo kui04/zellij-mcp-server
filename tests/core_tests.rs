@@ -26,8 +26,8 @@ use zellij_mcp_server::logs::{
 use zellij_mcp_server::runtime::{FreshManagedTab, PlaceholderPaneId};
 use zellij_mcp_server::state::{
     CleanupExecutionMode, CleanupRequest, CleanupScope, CleanupTarget, EvictablePane,
-    EvictionReason, FastTaskClosePolicy, ManagedRecord, ObservedPane, ReconciliationSnapshot,
-    RetentionPolicy, RetentionQuota, StateStore, ZellijEvent,
+    EvictionReason, FastTaskClosePolicy, ManagedRecord, ObservedPane, ObservedTab,
+    ReconciliationSnapshot, RetentionPolicy, RetentionQuota, StateStore, ZellijEvent,
 };
 use zellij_mcp_server::zellij::protocol::{
     is_active_session_in_list, is_session_not_found_stderr, parse_event_line,
@@ -517,6 +517,7 @@ fn state_store_transitions_gc_and_reconciliation() -> Result<()> {
             ready_pattern: None,
             prompt_pattern: None,
             lifecycle: EntityLifecycle::Task(TaskLifecycle::Running { started_at: t0 }),
+            exit_observed: false,
             logs: BoundedLogBuffer::default(),
             last_viewport: Vec::new(),
         });
@@ -554,6 +555,7 @@ fn state_store_transitions_gc_and_reconciliation() -> Result<()> {
             started_at: t0,
             ready_pattern: Some(CompiledPattern::parse("ready_pattern", "Local: http://")?),
         }),
+        exit_observed: false,
         logs: BoundedLogBuffer::default(),
         last_viewport: Vec::new(),
     });
@@ -723,6 +725,7 @@ fn regression_dead_session_detection_prompt_whitespace_tail_lines_and_stopping_s
         ready_pattern: None,
         prompt_pattern: None,
         lifecycle: EntityLifecycle::Service(ServiceLifecycle::Stopping { started_at: t0 }),
+        exit_observed: false,
         logs: BoundedLogBuffer::default(),
         last_viewport: Vec::new(),
     });
@@ -808,6 +811,11 @@ fn placeholder_panes_and_cleanup_receipt_enforce_spawn_ordering() -> Result<()> 
         panic!("expected cleanup receipt");
     };
     assert!(receipt.placeholders().is_empty());
+
+    // An abandoned fresh tab exposes its placeholders so the runtime can destroy the empty tab.
+    let placeholders = PlaceholderPaneId::collect_from_fresh_tab(fresh_tab, &panes);
+    let abandoned = FreshManagedTab::new(fresh_tab, placeholders).into_placeholders();
+    assert_eq!(abandoned.len(), 1);
     Ok(())
 }
 
@@ -1084,7 +1092,373 @@ fn cleanup_request_rejects_empty_scopes_and_selects_only_finished_panes() -> Res
     Ok(())
 }
 
+#[test]
+fn cleanup_skipped_active_count_respects_tab_target() -> Result<()> {
+    let mut store = StateStore::new(
+        SessionName::parse("cleanup-tabs")?,
+        RetentionPolicy {
+            completed_tasks: RetentionQuota::Unlimited,
+            failed_and_cancelled_tasks: RetentionQuota::Unlimited,
+            exited_repls: RetentionQuota::Unlimited,
+            fast_task_close: FastTaskClosePolicy::FollowCompletedQuota,
+        },
+    );
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    for (task, pane, tab) in [("t_01", 20u32, 1u32), ("t_02", 21, 2)] {
+        store.register(managed_record(
+            ManagedKey::Task(TaskId::parse(task)?),
+            TerminalPaneId::new(pane),
+            TabId::new(tab),
+            EntityLifecycle::Task(TaskLifecycle::Running { started_at: now }),
+        )?);
+    }
+
+    let tab_request = |tab: u32| {
+        CleanupRequest::parse(
+            vec![CleanupScope::CompletedTasks],
+            CleanupTarget::SingleTab(TabId::new(tab)),
+            CleanupExecutionMode::DryRun,
+        )
+    };
+    assert_eq!(store.count_skipped_active(&tab_request(1)?), 1);
+    assert_eq!(store.count_skipped_active(&tab_request(2)?), 1);
+    let session_request = CleanupRequest::parse(
+        vec![CleanupScope::CompletedTasks],
+        CleanupTarget::EntireSession,
+        CleanupExecutionMode::DryRun,
+    )?;
+    assert_eq!(store.count_skipped_active(&session_request), 2);
+    Ok(())
+}
+
+#[test]
+fn cleanup_requires_observed_exit_for_cancelled_tasks() -> Result<()> {
+    let mut store = StateStore::new(
+        SessionName::parse("cancel-exit")?,
+        RetentionPolicy {
+            completed_tasks: RetentionQuota::Unlimited,
+            failed_and_cancelled_tasks: RetentionQuota::Unlimited,
+            exited_repls: RetentionQuota::Unlimited,
+            fast_task_close: FastTaskClosePolicy::FollowCompletedQuota,
+        },
+    );
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let key = ManagedKey::Task(TaskId::parse("t_01")?);
+    let pane = TerminalPaneId::new(50);
+    // Timeouts now keep the task Running; the selector still guards a legacy terminal record whose
+    // process exit was never observed.
+    store.register(managed_record_with_exit(
+        key,
+        pane,
+        TabId::new(1),
+        EntityLifecycle::Task(TaskLifecycle::Cancelled {
+            started_at: now,
+            ended_at: now + Duration::from_secs(1),
+            exit_code: None,
+            pane_closed: false,
+        }),
+        false,
+    )?);
+    let request = CleanupRequest::parse(
+        vec![CleanupScope::CancelledTasks],
+        CleanupTarget::EntireSession,
+        CleanupExecutionMode::Execute,
+    )?;
+
+    assert!(
+        store.select_panes_for_cleanup(&request).is_empty(),
+        "a cancel that timed out must not be offered for cleanup"
+    );
+
+    let _ = store.apply_event(
+        ZellijEvent::PaneExited {
+            pane_id: pane,
+            exit_code: Some(130),
+        },
+        now + Duration::from_secs(2),
+    );
+    assert_eq!(
+        store.select_panes_for_cleanup(&request).len(),
+        1,
+        "an observed exit makes the finished pane evictable"
+    );
+    Ok(())
+}
+
+#[test]
+fn retention_quota_requires_observed_exit_for_cancelled_tasks() -> Result<()> {
+    let mut store = StateStore::new(
+        SessionName::parse("cancel-retention")?,
+        RetentionPolicy {
+            failed_and_cancelled_tasks: RetentionQuota::CloseImmediately,
+            ..RetentionPolicy::default()
+        },
+    );
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let key = ManagedKey::Task(TaskId::parse("t_01")?);
+    let pane = TerminalPaneId::new(51);
+    store.register(managed_record_with_exit(
+        key.clone(),
+        pane,
+        TabId::new(1),
+        EntityLifecycle::Task(TaskLifecycle::Cancelled {
+            started_at: now,
+            ended_at: now + Duration::from_secs(1),
+            exit_code: None,
+            pane_closed: false,
+        }),
+        false,
+    )?);
+
+    let before = store.enforce_retention(EvictionReason::RetentionGc);
+    assert!(before.visual_actions.is_empty());
+
+    let after = store.apply_event(
+        ZellijEvent::PaneExited {
+            pane_id: pane,
+            exit_code: Some(130),
+        },
+        now + Duration::from_secs(2),
+    );
+    assert!(
+        after
+            .visual_actions
+            .contains(&VisualAction::ClosePane { pane_id: pane })
+    );
+    assert!(
+        store
+            .get(&key)
+            .is_some_and(|record| record.lifecycle.is_pane_closed())
+    );
+    Ok(())
+}
+
+#[test]
+fn cleanup_requires_observed_exit_for_stopped_services() -> Result<()> {
+    let mut store = StateStore::new(SessionName::parse("stop-exit")?, RetentionPolicy::default());
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let key = ManagedKey::Service(ServiceName::parse("api")?);
+    let pane = TerminalPaneId::new(60);
+    // Timeouts now restore the service to Ready; the selector still guards a legacy Stopped
+    // record whose process exit was never observed.
+    store.register(managed_record_with_exit(
+        key,
+        pane,
+        TabId::new(1),
+        EntityLifecycle::Service(ServiceLifecycle::Stopped {
+            started_at: now,
+            ended_at: now + Duration::from_secs(1),
+            pane_closed: false,
+        }),
+        false,
+    )?);
+    let request = CleanupRequest::parse(
+        vec![CleanupScope::FailedServices],
+        CleanupTarget::EntireSession,
+        CleanupExecutionMode::Execute,
+    )?;
+
+    assert!(store.select_panes_for_cleanup(&request).is_empty());
+    let _ = store.apply_event(
+        ZellijEvent::PaneExited {
+            pane_id: pane,
+            exit_code: Some(130),
+        },
+        now + Duration::from_secs(2),
+    );
+    assert_eq!(store.select_panes_for_cleanup(&request).len(), 1);
+    Ok(())
+}
+
+#[test]
+fn mark_evicted_rechecks_observed_exit() -> Result<()> {
+    let mut store = StateStore::new(
+        SessionName::parse("revalidate-exit")?,
+        RetentionPolicy::default(),
+    );
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let key = ManagedKey::Task(TaskId::parse("t_01")?);
+    let pane = TerminalPaneId::new(70);
+    store.register(managed_record(
+        key.clone(),
+        pane,
+        TabId::new(1),
+        completed(now, now + Duration::from_secs(1), false),
+    )?);
+    let request = CleanupRequest::parse(
+        vec![CleanupScope::CompletedTasks],
+        CleanupTarget::EntireSession,
+        CleanupExecutionMode::Execute,
+    )?;
+    let selected = store.select_panes_for_cleanup(&request);
+    assert_eq!(selected.len(), 1);
+
+    let Some(record) = store.get_mut(&key) else {
+        panic!("record must exist");
+    };
+    record.exit_observed = false;
+    let effects = store.mark_evicted(&selected);
+    assert!(effects.visual_actions.is_empty());
+    assert_eq!(store.count_terminated_open_panes(), 0);
+    Ok(())
+}
+
+#[test]
+fn reconcile_resets_exit_observation_when_the_pane_is_rebound() -> Result<()> {
+    let mut store = StateStore::new(
+        SessionName::parse("reconcile-rebind")?,
+        RetentionPolicy::default(),
+    );
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let key = ManagedKey::Task(TaskId::parse("t_01")?);
+    let old_pane = TerminalPaneId::new(80);
+    let new_pane = TerminalPaneId::new(81);
+    store.register(managed_record(
+        key.clone(),
+        old_pane,
+        TabId::new(1),
+        completed(now, now + Duration::from_secs(1), false),
+    )?);
+
+    let tabs = vec![ObservedTab {
+        tab_id: TabId::new(1),
+        name: "Tab #1".to_owned(),
+        active: true,
+        viewport: ViewportSnapshot::new(80, 24, 1),
+    }];
+    let panes = vec![obs_pane(new_pane, TabId::new(1), "mcp:task:t_01", false)];
+    let _ = store.reconcile(
+        ReconciliationSnapshot {
+            tabs,
+            panes,
+            active_tab: None,
+        },
+        now + Duration::from_secs(2),
+    );
+
+    let Some(record) = store.get(&key) else {
+        panic!("record must exist");
+    };
+    assert_eq!(record.pane_id, new_pane);
+    assert!(
+        !record.exit_observed,
+        "a rebound pane is a new process, so the old exit observation must not carry over"
+    );
+    Ok(())
+}
+
+#[test]
+fn reconcile_reopens_a_terminal_pane_that_is_still_open() -> Result<()> {
+    let mut store = StateStore::new(
+        SessionName::parse("reconcile-reopen")?,
+        RetentionPolicy::default(),
+    );
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let key = ManagedKey::Task(TaskId::parse("t_01")?);
+    let pane = TerminalPaneId::new(90);
+    store.register(managed_record(
+        key.clone(),
+        pane,
+        TabId::new(1),
+        completed(now, now + Duration::from_secs(1), true),
+    )?);
+    assert!(
+        store
+            .get(&key)
+            .is_some_and(|record| record.lifecycle.is_pane_closed())
+    );
+
+    let tabs = vec![ObservedTab {
+        tab_id: TabId::new(1),
+        name: "Tab #1".to_owned(),
+        active: true,
+        viewport: ViewportSnapshot::new(80, 24, 1),
+    }];
+    let panes = vec![obs_pane(pane, TabId::new(1), "mcp:task:t_01", false)];
+    let _ = store.reconcile(
+        ReconciliationSnapshot {
+            tabs,
+            panes,
+            active_tab: None,
+        },
+        now + Duration::from_secs(2),
+    );
+
+    let Some(record) = store.get(&key) else {
+        panic!("record must exist");
+    };
+    assert!(
+        !record.lifecycle.is_pane_closed(),
+        "an observed open pane must clear a stale pane_closed flag"
+    );
+    let request = CleanupRequest::parse(
+        vec![CleanupScope::CompletedTasks],
+        CleanupTarget::EntireSession,
+        CleanupExecutionMode::DryRun,
+    )?;
+    assert_eq!(store.select_panes_for_cleanup(&request).len(), 1);
+    Ok(())
+}
+
+#[test]
+fn reconcile_without_retention_does_not_evict_panes() -> Result<()> {
+    let mut store = StateStore::new(
+        SessionName::parse("reconcile-no-retention")?,
+        RetentionPolicy {
+            completed_tasks: RetentionQuota::CloseImmediately,
+            ..RetentionPolicy::default()
+        },
+    );
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let pane_id = TerminalPaneId::new(91);
+    let key = ManagedKey::Task(TaskId::parse("t_01")?);
+    store.register(managed_record_with_exit(
+        key.clone(),
+        pane_id,
+        TabId::new(1),
+        EntityLifecycle::Task(TaskLifecycle::Running { started_at: now }),
+        false,
+    )?);
+    let mut exited_pane = obs_pane(pane_id, TabId::new(1), "mcp:task:t_01", false);
+    exited_pane.exited = true;
+    exited_pane.exit_status = Some(0);
+    let tabs = vec![ObservedTab {
+        tab_id: TabId::new(1),
+        name: "Tab #1".to_owned(),
+        active: true,
+        viewport: ViewportSnapshot::new(80, 24, 1),
+    }];
+    let effects = store.reconcile_without_retention(
+        ReconciliationSnapshot {
+            tabs,
+            panes: vec![exited_pane],
+            active_tab: None,
+        },
+        now + Duration::from_secs(2),
+    );
+
+    assert!(
+        !effects
+            .visual_actions
+            .iter()
+            .any(|action| matches!(action, VisualAction::ClosePane { .. })),
+        "a no-retention reconcile must not evict the exited pane"
+    );
+    assert_eq!(store.count_terminated_open_panes(), 1);
+    let evicted = store.enforce_retention(EvictionReason::RetentionGc);
+    assert_eq!(evicted.closed_panes, vec![pane_id]);
+    assert!(
+        store
+            .get(&key)
+            .is_some_and(|record| record.lifecycle.is_pane_closed())
+    );
+    Ok(())
+}
+
 /// Builds a managed record for retention and cleanup tests.
+///
+/// Defaults to an observed process exit; use [`managed_record_with_exit`] to model a cancel or
+/// stop that timed out while the process may still run.
 fn managed_record(
     key: ManagedKey,
     pane_id: TerminalPaneId,
@@ -1103,9 +1477,23 @@ fn managed_record(
         ready_pattern: None,
         prompt_pattern: None,
         lifecycle,
+        exit_observed: true,
         logs: BoundedLogBuffer::default(),
         last_viewport: Vec::new(),
     })
+}
+
+/// Builds a record whose process exit was either observed or deliberately left unproven.
+fn managed_record_with_exit(
+    key: ManagedKey,
+    pane_id: TerminalPaneId,
+    tab_id: TabId,
+    lifecycle: EntityLifecycle,
+    exit_observed: bool,
+) -> Result<ManagedRecord> {
+    let mut record = managed_record(key, pane_id, tab_id, lifecycle)?;
+    record.exit_observed = exit_observed;
+    Ok(record)
 }
 
 fn completed(started_at: SystemTime, ended_at: SystemTime, pane_closed: bool) -> EntityLifecycle {

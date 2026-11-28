@@ -353,7 +353,8 @@ pub struct WorkspaceCleanupResponse {
     pub pane_count: usize,
     /// Managed entity identifiers ("task:t_01", "svc:web-dev", "repl:py").
     pub entities: Vec<String>,
-    /// Running entities of the requested kinds that cleanup deliberately left alone.
+    /// Running entities of the requested kinds inside the requested tab that cleanup deliberately
+    /// left alone.
     pub skipped_active_count: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub alerts: Vec<WorkspaceAlertDto>,

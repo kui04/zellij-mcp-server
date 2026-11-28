@@ -39,7 +39,7 @@ use crate::state::{
 
 const MAX_TIMEOUT_MS: u64 = 3_600_000;
 
-/// MCP server exposing 12 high-level Zellij workspace orchestration tools over stdio.
+/// MCP server exposing 13 high-level Zellij workspace orchestration tools over stdio.
 #[derive(Debug, Clone)]
 pub struct ZellijMcpServer {
     orchestrator: WorkspaceOrchestrator,
@@ -236,7 +236,7 @@ impl ZellijMcpServer {
 
     #[tool(
         name = "workspace_cleanup",
-        description = "Close finished task, service, and REPL panes while keeping their logs readable through task_logs/service_logs. Defaults to completed, cancelled, and exited entities; pass dry_run=true to preview. Never stops a process that still runs. Use for: a workspace crowded with finished panes. Do NOT use for: stopping running work (use task_cancel, service_stop, repl_close).",
+        description = "Close finished task, service, and REPL panes while keeping their logs readable through task_logs/service_logs. Defaults to completed, cancelled, and exited entities; pass dry_run=true to preview. Never stops a process that still runs; panes whose process exit was not observed are left open. Use for: a workspace crowded with finished panes. Do NOT use for: stopping running work (use task_cancel, service_stop, repl_close).",
         annotations(destructive_hint = false, idempotent_hint = true)
     )]
     async fn workspace_cleanup(
@@ -480,7 +480,7 @@ impl ZellijMcpServer {
 
     #[tool(
         name = "task_cancel",
-        description = "Cancel a running task via Ctrl+C (with grace period), keeping the pane open by default so the human can inspect output. Use for: aborting a stuck or obsolete task.",
+        description = "Cancel a running task via Ctrl+C (with grace period), keeping the pane open by default so the human can inspect output. If the process ignores the signals it stays running and the status is `cancel_timeout`. Use for: aborting a stuck or obsolete task.",
         annotations(destructive_hint = true)
     )]
     async fn task_cancel(
@@ -500,11 +500,16 @@ impl ZellijMcpServer {
             .await
             .map_err(map_runtime_err)?;
 
+        let hint = (status == "cancel_timeout").then(|| {
+            "The task is still running after SIGINT/SIGQUIT. Retry task_cancel or pass close_pane=true to close its pane."
+                .to_owned()
+        });
+
         Ok(Json(SimpleActionResponse {
             id: task_id.to_string(),
             status,
             alerts: map_alerts(alerts),
-            hint: None,
+            hint,
         }))
     }
 
@@ -639,7 +644,7 @@ impl ZellijMcpServer {
 
     #[tool(
         name = "service_stop",
-        description = "Gracefully stop a long-lived service, closing its pane by default and releasing its viewport subscription.",
+        description = "Gracefully stop a long-lived service, closing its pane by default and releasing its viewport subscription. If it does not exit within the grace period it stays ready and the status is `cancel_timeout`.",
         annotations(destructive_hint = true)
     )]
     async fn service_stop(
@@ -659,11 +664,16 @@ impl ZellijMcpServer {
             .await
             .map_err(map_runtime_err)?;
 
+        let hint = (status == "cancel_timeout").then(|| {
+            "The service is still running after the stop signal. Retry service_stop or pass close_pane=true to close its pane."
+                .to_owned()
+        });
+
         Ok(Json(SimpleActionResponse {
             id: name.to_string(),
             status,
             alerts: map_alerts(alerts),
-            hint: None,
+            hint,
         }))
     }
 

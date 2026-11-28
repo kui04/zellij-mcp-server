@@ -644,6 +644,7 @@ impl ZellijClient {
                 ctrl.ensure_alive()?;
                 ctrl.record(&format!("visual:{action:?}"));
                 if let VisualAction::ClosePane { pane_id } = action {
+                    ctrl.check_close_pane_failure()?;
                     ctrl.mock_remove_pane(*pane_id);
                 }
                 Ok(())
@@ -700,6 +701,15 @@ pub mod mock {
     use crate::state::{ObservedPane, ObservedTab};
     use crate::zellij::cli::{NewPaneSpec, SessionAttachment};
 
+    /// Scripted `close-pane` failure for mock tests.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum ClosePaneFailure {
+        #[default]
+        None,
+        Rejected,
+        SessionNotFound,
+    }
+
     /// Cloneable handle to inspect recorded calls and script mock responses.
     #[derive(Debug, Clone)]
     pub struct MockZellijCtrl {
@@ -725,6 +735,8 @@ pub mod mock {
         fail_stacked: bool,
         fail_no_room: bool,
         fail_new_pane: bool,
+        fail_next_list_panes: bool,
+        close_pane_failure: ClosePaneFailure,
         recorded_actions: Vec<String>,
     }
 
@@ -764,6 +776,8 @@ pub mod mock {
                         fail_stacked: false,
                         fail_no_room: false,
                         fail_new_pane: false,
+                        fail_next_list_panes: false,
+                        close_pane_failure: ClosePaneFailure::None,
                         recorded_actions: Vec::new(),
                     }),
                 }),
@@ -813,6 +827,32 @@ pub mod mock {
         /// all placements until cleared.
         pub fn set_fail_new_pane(&self, fail: bool) {
             self.lock_state().fail_new_pane = fail;
+        }
+
+        /// Makes the next `list-panes` call fail, exercising post-`new-tab` fallback paths.
+        pub fn fail_next_list_panes(&self) {
+            self.lock_state().fail_next_list_panes = true;
+        }
+
+        /// Scripts every `close-pane` call to fail until cleared.
+        pub fn set_close_pane_failure(&self, failure: ClosePaneFailure) {
+            self.lock_state().close_pane_failure = failure;
+        }
+
+        /// Returns the scripted `close-pane` failure, marking the mock session dead when the
+        /// failure simulates a disappeared session.
+        pub(crate) fn check_close_pane_failure(&self) -> Result<()> {
+            let mut state = self.lock_state();
+            match state.close_pane_failure {
+                ClosePaneFailure::None => Ok(()),
+                ClosePaneFailure::Rejected => bail!(
+                    "zellij [\"action\", \"close-pane\"] exited with exit status: 1: stderr=close-pane failed, stdout="
+                ),
+                ClosePaneFailure::SessionNotFound => {
+                    state.session_alive = false;
+                    Err(DomainError::SessionNotFound(self.inner.session.clone()).into())
+                }
+            }
         }
 
         pub fn set_focused_pane_geometry(&self, columns: u16, rows: u16) {
@@ -1036,7 +1076,14 @@ pub mod mock {
 
         pub(crate) fn mock_list_panes(&self) -> Result<Vec<ObservedPane>> {
             self.ensure_alive()?;
-            Ok(self.lock_state().panes.clone())
+            let mut state = self.lock_state();
+            if state.fail_next_list_panes {
+                state.fail_next_list_panes = false;
+                bail!(
+                    "zellij [\"action\", \"list-panes\"] exited with exit status: 1: stderr=list-panes failed, stdout="
+                );
+            }
+            Ok(state.panes.clone())
         }
     }
 }

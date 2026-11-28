@@ -142,7 +142,7 @@ pub enum EvictionReason {
 /// Proof that a managed pane is finished and still open, so closing it cannot kill a process.
 ///
 /// Fields are private: only [`StateStore`] builds one, after checking that the lifecycle is
-/// terminal and the pane is still open.
+/// terminal, [`ManagedRecord::exit_observed`] is set, and the pane is still open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvictablePane {
     key: ManagedKey,
@@ -283,6 +283,16 @@ pub enum CleanupTarget {
     SingleTab(TabId),
 }
 
+impl CleanupTarget {
+    /// Whether `tab_id` falls inside this target; the session target includes every tab.
+    fn includes(self, tab_id: TabId) -> bool {
+        match self {
+            Self::EntireSession => true,
+            Self::SingleTab(target) => target == tab_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanupExecutionMode {
     Execute,
@@ -336,6 +346,12 @@ pub struct ManagedRecord {
     pub ready_pattern: Option<CompiledPattern>,
     pub prompt_pattern: Option<CompiledPattern>,
     pub lifecycle: EntityLifecycle,
+    /// True once `PaneExited`, `PaneClosed`, or reconciliation proved the process is gone.
+    ///
+    /// A terminal lifecycle alone is not enough to close a pane: `task_cancel` and `service_stop`
+    /// mark an entity terminal after a fixed grace period even when the process ignored the
+    /// signal. Retention and cleanup require this flag so they cannot kill a live process.
+    pub exit_observed: bool,
     pub logs: BoundedLogBuffer,
     pub last_viewport: Vec<String>,
 }
@@ -470,6 +486,14 @@ impl StateStore {
     /// Registers a managed record and replays any early exit/close event that arrived between
     /// `new-pane` and `register`.
     pub fn register(&mut self, record: ManagedRecord) -> TransitionEffects {
+        self.register_inner(record, true)
+    }
+
+    fn register_inner(
+        &mut self,
+        record: ManagedRecord,
+        apply_retention: bool,
+    ) -> TransitionEffects {
         let pane_id = record.pane_id;
         if let Some(old) = self.panes_by_key.insert(record.key.clone(), record.clone())
             && old.pane_id != pane_id
@@ -480,14 +504,18 @@ impl StateStore {
 
         let mut effects = TransitionEffects::default();
         if let Some(exit_code) = self.early_exits.remove(&pane_id) {
-            effects.extend(self.apply_event(
+            effects.extend(self.apply_event_inner(
                 ZellijEvent::PaneExited { pane_id, exit_code },
                 SystemTime::now(),
+                apply_retention,
             ));
         }
         if self.early_closes.remove(&pane_id) {
-            effects
-                .extend(self.apply_event(ZellijEvent::PaneClosed { pane_id }, SystemTime::now()));
+            effects.extend(self.apply_event_inner(
+                ZellijEvent::PaneClosed { pane_id },
+                SystemTime::now(),
+                apply_retention,
+            ));
         }
         effects
     }
@@ -540,6 +568,15 @@ impl StateStore {
 
     /// Applies a single `zellij events` notification to the state machine.
     pub fn apply_event(&mut self, event: ZellijEvent, now: SystemTime) -> TransitionEffects {
+        self.apply_event_inner(event, now, true)
+    }
+
+    fn apply_event_inner(
+        &mut self,
+        event: ZellijEvent,
+        now: SystemTime,
+        apply_retention: bool,
+    ) -> TransitionEffects {
         let mut effects = TransitionEffects::default();
         match event {
             ZellijEvent::PaneExited { pane_id, exit_code } => {
@@ -553,6 +590,7 @@ impl StateStore {
                 let Some(record) = self.panes_by_key.get_mut(&key) else {
                     return effects;
                 };
+                record.exit_observed = true;
                 match &record.lifecycle {
                     EntityLifecycle::Task(TaskLifecycle::Running { started_at }) => {
                         let started_at = *started_at;
@@ -710,6 +748,7 @@ impl StateStore {
                 let Some(record) = self.panes_by_key.get_mut(&key) else {
                     return effects;
                 };
+                record.exit_observed = true;
                 mark_lifecycle_pane_closed(&mut record.lifecycle);
                 if record.lifecycle.is_active() {
                     record.lifecycle = match &record.lifecycle {
@@ -761,7 +800,9 @@ impl StateStore {
                 effects.subscription_dirty = true;
             }
         }
-        effects.extend(self.enforce_retention(EvictionReason::RetentionGc));
+        if apply_retention {
+            effects.extend(self.enforce_retention(EvictionReason::RetentionGc));
+        }
         effects
     }
 
@@ -869,6 +910,25 @@ impl StateStore {
         snapshot: ReconciliationSnapshot,
         now: SystemTime,
     ) -> TransitionEffects {
+        self.reconcile_inner(snapshot, now, true)
+    }
+
+    /// Reconciles without applying retention, so callers that must not close panes outside their
+    /// own selection (such as cleanup previews) cannot trigger a background eviction.
+    pub fn reconcile_without_retention(
+        &mut self,
+        snapshot: ReconciliationSnapshot,
+        now: SystemTime,
+    ) -> TransitionEffects {
+        self.reconcile_inner(snapshot, now, false)
+    }
+
+    fn reconcile_inner(
+        &mut self,
+        snapshot: ReconciliationSnapshot,
+        now: SystemTime,
+        apply_retention: bool,
+    ) -> TransitionEffects {
         let mut effects = TransitionEffects::default();
         self.session_dead = false;
 
@@ -909,6 +969,7 @@ impl StateStore {
         // Mark previously tracked panes that disappeared as closed / StoppedByUser.
         for record in self.panes_by_key.values_mut() {
             if !live_pane_ids.contains(&record.pane_id) {
+                record.exit_observed = true;
                 mark_lifecycle_pane_closed(&mut record.lifecycle);
                 if record.lifecycle.is_active() {
                     effects.closed_panes.push(record.pane_id);
@@ -946,6 +1007,18 @@ impl StateStore {
                 let old_pane_id = existing.pane_id;
                 existing.tab_id = pane.tab_id;
                 existing.pane_title = pane.title;
+                // A pane id change means a new process; the previous exit observation no longer
+                // applies, so reset it to what this pane reports instead of carrying it over.
+                existing.exit_observed = if old_pane_id == pane.pane_id {
+                    existing.exit_observed || pane.exited
+                } else {
+                    pane.exited
+                };
+                // Observing an open pane proves a previous close did not take effect, so clear the
+                // stale flag and let retention or cleanup retry the close.
+                if existing.lifecycle.is_pane_closed() {
+                    mark_lifecycle_pane_open(&mut existing.lifecycle);
+                }
                 if old_pane_id != pane.pane_id {
                     existing.pane_id = pane.pane_id;
                     let _ = self.key_by_pane_id.remove(&old_pane_id);
@@ -954,12 +1027,13 @@ impl StateStore {
                 }
                 if pane.exited && existing.lifecycle.is_active() {
                     let pane_id = existing.pane_id;
-                    effects.extend(self.apply_event(
+                    effects.extend(self.apply_event_inner(
                         ZellijEvent::PaneExited {
                             pane_id,
                             exit_code: pane.exit_status,
                         },
                         now,
+                        apply_retention,
                     ));
                 }
                 continue;
@@ -1036,25 +1110,31 @@ impl StateStore {
                 }
             };
 
-            effects.extend(self.register(ManagedRecord {
-                key: parsed.key,
-                tab_id: pane.tab_id,
-                pane_id: pane.pane_id,
-                pane_title: pane.title,
-                label: parsed.label,
-                placement,
-                cmd,
-                cwd: pane.cwd.unwrap_or_else(|| PathBuf::from(".")),
-                ready_pattern: None,
-                prompt_pattern: None,
-                lifecycle,
-                logs: BoundedLogBuffer::default(),
-                last_viewport: Vec::new(),
-            }));
+            effects.extend(self.register_inner(
+                ManagedRecord {
+                    key: parsed.key,
+                    tab_id: pane.tab_id,
+                    pane_id: pane.pane_id,
+                    pane_title: pane.title,
+                    label: parsed.label,
+                    placement,
+                    cmd,
+                    cwd: pane.cwd.unwrap_or_else(|| PathBuf::from(".")),
+                    ready_pattern: None,
+                    prompt_pattern: None,
+                    lifecycle,
+                    exit_observed: pane.exited,
+                    logs: BoundedLogBuffer::default(),
+                    last_viewport: Vec::new(),
+                },
+                apply_retention,
+            ));
         }
 
         self.prune_closed_history(MAX_RETAINED_CLOSED_RECORDS);
-        effects.extend(self.enforce_retention(EvictionReason::RetentionGc));
+        if apply_retention {
+            effects.extend(self.enforce_retention(EvictionReason::RetentionGc));
+        }
         effects
     }
 
@@ -1157,7 +1237,7 @@ impl StateStore {
         let mut candidates: Vec<(SystemTime, TerminalPaneId, &ManagedRecord)> = self
             .panes_by_key
             .values()
-            .filter(|rec| class.matches(&rec.lifecycle))
+            .filter(|rec| rec.exit_observed && class.matches(&rec.lifecycle))
             .map(|rec| {
                 let ended_at = rec
                     .lifecycle
@@ -1179,8 +1259,8 @@ impl StateStore {
 
     /// Marks panes closed and returns their close effects.
     ///
-    /// A selection can be stale by the time it runs, so panes that became active or already
-    /// closed are skipped instead of closed.
+    /// A selection can be stale by the time it runs, so panes that became active, already closed,
+    /// or no longer have an observed process exit are skipped instead of closed.
     pub fn mark_evicted(&mut self, panes: &[EvictablePane]) -> TransitionEffects {
         let mut effects = TransitionEffects::default();
         for pane in panes {
@@ -1190,7 +1270,10 @@ impl StateStore {
             let Some(record) = self.panes_by_key.get_mut(&pane.key) else {
                 continue;
             };
-            if record.lifecycle.is_active() || record.lifecycle.is_pane_closed() {
+            if !record.exit_observed
+                || record.lifecycle.is_active()
+                || record.lifecycle.is_pane_closed()
+            {
                 continue;
             }
             mark_lifecycle_pane_closed(&mut record.lifecycle);
@@ -1199,16 +1282,15 @@ impl StateStore {
         effects
     }
 
-    /// Selects finished panes with an open pane that match the cleanup request.
+    /// Selects finished panes with an open pane whose process exit was observed.
     pub fn select_panes_for_cleanup(&self, request: &CleanupRequest) -> Vec<EvictablePane> {
         let mut selected: Vec<(SystemTime, EvictablePane)> = self
             .panes_by_key
             .values()
-            .filter(|rec| !rec.lifecycle.is_active() && !rec.lifecycle.is_pane_closed())
-            .filter(|rec| match request.target {
-                CleanupTarget::EntireSession => true,
-                CleanupTarget::SingleTab(tab_id) => rec.tab_id == tab_id,
+            .filter(|rec| {
+                rec.exit_observed && !rec.lifecycle.is_active() && !rec.lifecycle.is_pane_closed()
             })
+            .filter(|rec| request.target.includes(rec.tab_id))
             .filter(|rec| {
                 request
                     .scopes
@@ -1230,10 +1312,12 @@ impl StateStore {
         selected.into_iter().map(|(_, pane)| pane).collect()
     }
 
-    /// Counts active entities of the kinds the request addresses, which cleanup must never touch.
+    /// Counts active entities of the kinds the request addresses inside its target tab, which
+    /// cleanup must never touch.
     pub fn count_skipped_active(&self, request: &CleanupRequest) -> usize {
         self.panes_by_key
             .values()
+            .filter(|rec| request.target.includes(rec.tab_id))
             .filter(|rec| {
                 rec.lifecycle.is_active()
                     && request
@@ -1244,11 +1328,13 @@ impl StateStore {
             .count()
     }
 
-    /// Counts finished entities whose pane is still open, the `workspace_cleanup` backlog.
+    /// Counts finished entities whose process exit was observed and whose pane is still open.
     pub fn count_terminated_open_panes(&self) -> usize {
         self.panes_by_key
             .values()
-            .filter(|rec| !rec.lifecycle.is_active() && !rec.lifecycle.is_pane_closed())
+            .filter(|rec| {
+                rec.exit_observed && !rec.lifecycle.is_active() && !rec.lifecycle.is_pane_closed()
+            })
             .count()
     }
 
@@ -1256,13 +1342,15 @@ impl StateStore {
     pub fn mark_fast_task_for_close(&mut self, key: &ManagedKey) -> Option<EvictablePane> {
         let pane = {
             let record = self.panes_by_key.get(key)?;
-            if !matches!(
-                record.lifecycle,
-                EntityLifecycle::Task(TaskLifecycle::Completed {
-                    pane_closed: false,
-                    ..
-                })
-            ) {
+            if !record.exit_observed
+                || !matches!(
+                    record.lifecycle,
+                    EntityLifecycle::Task(TaskLifecycle::Completed {
+                        pane_closed: false,
+                        ..
+                    })
+                )
+            {
                 return None;
             }
             evictable(record, EvictionReason::FastPathAutoClose)
@@ -1299,6 +1387,39 @@ fn mark_lifecycle_pane_closed(lifecycle: &mut EntityLifecycle) {
         )
         | EntityLifecycle::Repl(ReplLifecycle::Exited { pane_closed, .. }) => {
             *pane_closed = true;
+        }
+        EntityLifecycle::Task(
+            TaskLifecycle::Running { .. } | TaskLifecycle::StoppedByUser { .. },
+        )
+        | EntityLifecycle::Service(
+            ServiceLifecycle::Starting { .. }
+            | ServiceLifecycle::Ready { .. }
+            | ServiceLifecycle::Stopping { .. }
+            | ServiceLifecycle::StoppedByUser { .. },
+        )
+        | EntityLifecycle::Repl(
+            ReplLifecycle::Starting { .. }
+            | ReplLifecycle::Idle { .. }
+            | ReplLifecycle::Busy { .. }
+            | ReplLifecycle::InputRequired { .. }
+            | ReplLifecycle::StoppedByUser { .. },
+        ) => {}
+    }
+}
+
+fn mark_lifecycle_pane_open(lifecycle: &mut EntityLifecycle) {
+    match lifecycle {
+        EntityLifecycle::Task(
+            TaskLifecycle::Completed { pane_closed, .. }
+            | TaskLifecycle::Failed { pane_closed, .. }
+            | TaskLifecycle::Cancelled { pane_closed, .. },
+        )
+        | EntityLifecycle::Service(
+            ServiceLifecycle::Failed { pane_closed, .. }
+            | ServiceLifecycle::Stopped { pane_closed, .. },
+        )
+        | EntityLifecycle::Repl(ReplLifecycle::Exited { pane_closed, .. }) => {
+            *pane_closed = false;
         }
         EntityLifecycle::Task(
             TaskLifecycle::Running { .. } | TaskLifecycle::StoppedByUser { .. },

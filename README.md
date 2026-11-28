@@ -21,9 +21,9 @@ long-lived background services, and stateful interactive REPL sessions inside re
   `$ZELLIJ_SESSION_NAME` without tearing down user-owned sessions; when started outside Zellij,
   creates a unique `mcp-<cwd>-<hex>` session and cleans it up on exit unless `--keep-session` is
   set.
-- **Bounded pane retention**: finished task, service, and REPL panes close on per-class quotas (or
-  on `workspace_cleanup`), and scrollback is backfilled first so `task_logs` / `service_logs` keep
-  working after the pane is gone.
+- **Bounded pane retention**: finished task and exited REPL panes close on per-class quotas, and
+  `workspace_cleanup` closes finished task, service, and REPL panes on demand. Scrollback is
+  backfilled first so `task_logs` / `service_logs` keep working after the pane is gone.
 - **Optional human confirmation gate**: `--confirm-destructive` gates `task_cancel`, `service_stop`,
   and `repl_close` behind `zellij prompt confirm`.
 
@@ -110,19 +110,19 @@ Add `zellij-mcp-server` to your MCP client configuration (for example `.pi/mcp.j
 
 ### Workspace
 
-| Tool                | Parameters                       | Description                                                                                                                                                                                                                                                                 |
-| ------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `workspace_status`  | `session?`                       | Lists managed tasks, services, and REPLs (each with `pane_closed`), live viewport dimensions, `layout_tier`, `managed_tabs`, and `attach_command`. Retains up to 50 closed records, and hints at `workspace_cleanup` once more than 4 finished panes stay open.             |
-| `workspace_cleanup` | `scopes?`, `tab_id?`, `dry_run?` | Closes finished panes while keeping their logs readable. `scopes` defaults to `["completed", "cancelled", "exited"]`; also accepts `failed`, `failed_services`, and `all_inactive`. Never touches running entities, and `dry_run = true` previews without closing anything. |
+| Tool                | Parameters                       | Description                                                                                                                                                                                                                                                                                                                          |
+| ------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `workspace_status`  | `session?`                       | Lists managed tasks, services, and REPLs (each with `pane_closed`), live viewport dimensions, `layout_tier`, `managed_tabs`, and `attach_command`. Retains up to 50 closed records, and hints at `workspace_cleanup` once more than 4 finished panes stay open.                                                                      |
+| `workspace_cleanup` | `scopes?`, `tab_id?`, `dry_run?` | Closes finished panes while keeping their logs readable. `scopes` defaults to `["completed", "cancelled", "exited"]`; also accepts `failed`, `failed_services`, and `all_inactive`. Never touches running entities; panes whose process exit was not observed are left open, and `dry_run = true` previews without closing anything. |
 
 ### Tasks (finite commands with exit codes)
 
-| Tool          | Parameters                                       | Description                                                                                                                                        |
-| ------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `task_run`    | `cmd`, `cwd?`, `name?`, `wait_ms?`, `placement?` | Runs an argv command in a Zellij pane. Returns immediately if finished within `wait_ms` (default `3000`); otherwise returns `running` + `task_id`. |
-| `task_wait`   | `task_ids`, `mode?`, `timeout_ms?`               | Blocks server-side until `any` or `all` (default) tasks finish or `timeout_ms` (default `60000`) elapses.                                          |
-| `task_logs`   | `task_id`, `tail_lines?`, `grep?`                | Reads ANSI-stripped task output (`tail_lines` default `100`) with optional regex filtering.                                                        |
-| `task_cancel` | `task_id`, `close_pane?`                         | Sends `Ctrl+C` to cancel a running task. Keeps the pane open by default (`close_pane = false`).                                                    |
+| Tool          | Parameters                                       | Description                                                                                                                                                               |
+| ------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `task_run`    | `cmd`, `cwd?`, `name?`, `wait_ms?`, `placement?` | Runs an argv command in a Zellij pane. Returns immediately if finished within `wait_ms` (default `3000`); otherwise returns `running` + `task_id`.                        |
+| `task_wait`   | `task_ids`, `mode?`, `timeout_ms?`               | Blocks server-side until `any` or `all` (default) tasks finish or `timeout_ms` (default `60000`) elapses.                                                                 |
+| `task_logs`   | `task_id`, `tail_lines?`, `grep?`                | Reads ANSI-stripped task output (`tail_lines` default `100`) with optional regex filtering.                                                                               |
+| `task_cancel` | `task_id`, `close_pane?`                         | Sends `Ctrl+C` (escalating to SIGQUIT) to cancel a running task. Keeps the pane open by default (`close_pane = false`); returns `cancel_timeout` if the process survives. |
 
 ### Services (long-lived background processes)
 
@@ -131,7 +131,7 @@ Add `zellij-mcp-server` to your MCP client configuration (for example `.pi/mcp.j
 | `service_start`   | `name`, `cmd`, `cwd?`, `ready_pattern?`, `ready_timeout_ms?`, `placement?` | Idempotently starts or reuses a named service, optionally waiting up to `ready_timeout_ms` (default `15000`) for `ready_pattern`. |
 | `service_logs`    | `name`, `tail_lines?`, `since_seq?`, `grep?`                               | Reads incremental service logs (`tail_lines` default `80`) using `since_seq` / `next_seq` cursors.                                |
 | `service_restart` | `name`, `ready_timeout_ms?`                                                | Stops and restarts a service using its recorded configuration (`ready_timeout_ms` default `15000`).                               |
-| `service_stop`    | `name`, `close_pane?`                                                      | Gracefully stops a service and closes its pane by default (`close_pane = true`).                                                  |
+| `service_stop`    | `name`, `close_pane?`                                                      | Gracefully stops a service and closes its pane by default (`close_pane = true`); returns `cancel_timeout` if it survives.         |
 
 ### REPLs (stateful interactive sessions)
 

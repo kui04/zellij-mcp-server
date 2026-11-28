@@ -8,8 +8,8 @@ use std::time::Duration;
 use anyhow::Result;
 use zellij_mcp_server::domain::error::DomainError;
 use zellij_mcp_server::domain::ids::{
-    CommandSpec, CompiledPattern, EnterPolicy, PaneClosePolicy, ReplInput, ReplName, ServiceName,
-    SessionName, SessionResolution, TabId, TerminalPaneId, WaitMode,
+    CommandSpec, CompiledPattern, EnterPolicy, ManagedKey, PaneClosePolicy, ReplInput, ReplName,
+    ServiceName, SessionName, SessionResolution, TabId, TaskId, TerminalPaneId, WaitMode,
 };
 use zellij_mcp_server::domain::layout::{LayoutConstraints, PlacementRequest, ResolvedPlacement};
 use zellij_mcp_server::runtime::{
@@ -21,6 +21,7 @@ use zellij_mcp_server::state::{
     RetentionPolicy, RetentionQuota, ZellijEvent,
 };
 use zellij_mcp_server::zellij::cli::ZellijClient;
+use zellij_mcp_server::zellij::cli::mock::ClosePaneFailure;
 use zellij_mcp_server::zellij::protocol::SubscribeFrame;
 
 fn make_orchestrator(
@@ -932,11 +933,69 @@ async fn fast_successful_task_closes_its_pane_and_keeps_logs_readable() -> Resul
         ctrl.has_pane(TerminalPaneId::new(0)),
         "unrelated panes must stay open"
     );
+    let dumps = ctrl
+        .recorded_actions()
+        .iter()
+        .filter(|action| action.starts_with("dump_screen:"))
+        .count();
+    assert_eq!(
+        dumps,
+        2,
+        "fast close must not dump the screen a third time: {:?}",
+        ctrl.recorded_actions()
+    );
 
     // The scrollback was backfilled before closing, so task_logs still answers.
     let (logs, _) = orch.task_logs(&task_id, 10, None).await?;
     assert!(logs.pane_closed);
     assert!(logs.output.contains("fast-out"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn retention_close_reuses_the_exit_backfill() -> Result<()> {
+    let (orch, ctrl) = make_orchestrator_with_retention(
+        "mock-retention-backfill",
+        RetentionPolicy {
+            completed_tasks: RetentionQuota::CloseImmediately,
+            fast_task_close: FastTaskClosePolicy::FollowCompletedQuota,
+            ..RetentionPolicy::default()
+        },
+    )?;
+    orch.initialize().await?;
+
+    let (running, _) = orch
+        .task_run(TaskRunRequest {
+            cmd: CommandSpec::parse(vec!["sleep".into(), "60".into()])?,
+            cwd: None,
+            name: Some("gc".into()),
+            wait_timeout: Duration::from_millis(10),
+            placement: PlacementRequest::Auto,
+        })
+        .await?;
+    let pane_id = match running {
+        TaskRunOutcome::Running { pane_id, .. } => pane_id,
+        TaskRunOutcome::Completed { .. } => panic!("expected running"),
+    };
+    ctrl.set_screen_dump(pane_id, "gc-out");
+    orch.inject_event(ZellijEvent::PaneExited {
+        pane_id,
+        exit_code: Some(0),
+    })
+    .await;
+
+    let dumps = ctrl
+        .recorded_actions()
+        .iter()
+        .filter(|action| action.starts_with("dump_screen:"))
+        .count();
+    assert_eq!(
+        dumps,
+        1,
+        "retention close must reuse the exit backfill: {:?}",
+        ctrl.recorded_actions()
+    );
+    assert!(!ctrl.has_pane(pane_id));
     Ok(())
 }
 
@@ -1010,9 +1069,9 @@ async fn workspace_cleanup_previews_and_closes_only_finished_panes() -> Result<(
     orch.initialize().await?;
 
     // A completed task whose pane stays open (fast close follows the completed quota here).
-    let done_pane = run_finishing_task(&orch, &ctrl, "done", "marker", Some(0)).await?;
+    let (_, done_pane) = run_finishing_task(&orch, &ctrl, "done", "marker", Some(0)).await?;
     // A failed task whose pane also stays open.
-    let failed_pane = run_finishing_task(&orch, &ctrl, "boom", "boom", Some(2)).await?;
+    let (_, failed_pane) = run_finishing_task(&orch, &ctrl, "boom", "boom", Some(2)).await?;
 
     // A still-running task that cleanup must never touch.
     let (running, _) = orch
@@ -1087,6 +1146,270 @@ async fn workspace_cleanup_previews_and_closes_only_finished_panes() -> Result<(
     Ok(())
 }
 
+#[tokio::test]
+async fn cancel_timeout_keeps_the_task_waitable_and_running() -> Result<()> {
+    let (orch, ctrl) = make_orchestrator_with_retention(
+        "mock-cancel-observed",
+        RetentionPolicy {
+            completed_tasks: RetentionQuota::Unlimited,
+            failed_and_cancelled_tasks: RetentionQuota::Unlimited,
+            ..RetentionPolicy::default()
+        },
+    )?;
+    orch.initialize().await?;
+
+    let (running, _) = orch
+        .task_run(TaskRunRequest {
+            cmd: CommandSpec::parse(vec!["sleep".into(), "60".into()])?,
+            cwd: None,
+            name: Some("stubborn".into()),
+            wait_timeout: Duration::from_millis(10),
+            placement: PlacementRequest::Auto,
+        })
+        .await?;
+    let (task_id, pane_id) = match running {
+        TaskRunOutcome::Running {
+            task_id, pane_id, ..
+        } => (task_id, pane_id),
+        TaskRunOutcome::Completed { .. } => panic!("expected running"),
+    };
+
+    let (status, _) = orch
+        .task_cancel(&task_id, PaneClosePolicy::KeepPane)
+        .await?;
+    assert_eq!(status, "cancel_timeout");
+    let (waited, _) = orch
+        .task_wait(vec![task_id], WaitMode::All, Duration::from_millis(100))
+        .await?;
+    assert!(
+        waited.timed_out,
+        "cancel_timeout must leave the task waitable instead of reporting a terminal state"
+    );
+    assert_eq!(waited.tasks[0].status, "running");
+
+    let cancelled_cleanup = CleanupRequest::parse(
+        vec![CleanupScope::CancelledTasks],
+        CleanupTarget::EntireSession,
+        CleanupExecutionMode::Execute,
+    )?;
+    let (before_exit, _) = orch.workspace_cleanup(cancelled_cleanup).await?;
+    match before_exit {
+        CleanupOutcome::Executed { closed, .. } => assert!(closed.is_empty()),
+        CleanupOutcome::DryRunPreview { .. } => panic!("expected execution"),
+    }
+    assert!(
+        ctrl.has_pane(pane_id),
+        "a cancel that timed out must not let cleanup close a live pane"
+    );
+
+    orch.inject_event(ZellijEvent::PaneExited {
+        pane_id,
+        exit_code: Some(130),
+    })
+    .await;
+    let failed_cleanup = CleanupRequest::parse(
+        vec![CleanupScope::FailedTasks],
+        CleanupTarget::EntireSession,
+        CleanupExecutionMode::Execute,
+    )?;
+    let (after_exit, _) = orch.workspace_cleanup(failed_cleanup).await?;
+    match after_exit {
+        CleanupOutcome::Executed { closed, .. } => assert_eq!(closed.len(), 1),
+        CleanupOutcome::DryRunPreview { .. } => panic!("expected execution"),
+    }
+    assert!(!ctrl.has_pane(pane_id));
+    Ok(())
+}
+
+#[tokio::test]
+async fn stop_timeout_keeps_the_service_ready() -> Result<()> {
+    let (orch, ctrl) = make_orchestrator_with_retention(
+        "mock-stop-observed",
+        RetentionPolicy {
+            completed_tasks: RetentionQuota::Unlimited,
+            failed_and_cancelled_tasks: RetentionQuota::Unlimited,
+            ..RetentionPolicy::default()
+        },
+    )?;
+    orch.initialize().await?;
+
+    let name = ServiceName::parse("stubborn-svc")?;
+    let (svc, _) = orch
+        .service_start(ServiceStartRequest {
+            name: name.clone(),
+            cmd: CommandSpec::parse(vec!["sleep".into(), "60".into()])?,
+            cwd: None,
+            ready_pattern: None,
+            ready_timeout: Duration::from_millis(500),
+            placement: PlacementRequest::Auto,
+        })
+        .await?;
+    assert_eq!(svc.status, "ready");
+
+    let (status, _) = orch.service_stop(&name, PaneClosePolicy::KeepPane).await?;
+    assert_eq!(status, "cancel_timeout");
+    let key = ManagedKey::Service(name.clone());
+    let Some(record) = orch.get_record(&key).await else {
+        panic!("service record must exist");
+    };
+    assert_eq!(
+        record.lifecycle.status_label(),
+        "ready",
+        "a stop that timed out must restore the service to its running state"
+    );
+    let request = CleanupRequest::parse(
+        vec![CleanupScope::FailedServices],
+        CleanupTarget::EntireSession,
+        CleanupExecutionMode::Execute,
+    )?;
+    let (before_exit, _) = orch.workspace_cleanup(request.clone()).await?;
+    match before_exit {
+        CleanupOutcome::Executed { closed, .. } => assert!(closed.is_empty()),
+        CleanupOutcome::DryRunPreview { .. } => panic!("expected execution"),
+    }
+    assert!(
+        ctrl.has_pane(svc.pane_id),
+        "a stop that timed out must not let cleanup close a live service"
+    );
+
+    orch.inject_event(ZellijEvent::PaneExited {
+        pane_id: svc.pane_id,
+        exit_code: Some(130),
+    })
+    .await;
+    let (after_exit, _) = orch.workspace_cleanup(request).await?;
+    match after_exit {
+        CleanupOutcome::Executed { closed, .. } => assert_eq!(closed.len(), 1),
+        CleanupOutcome::DryRunPreview { .. } => panic!("expected execution"),
+    }
+    assert!(!ctrl.has_pane(svc.pane_id));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_retries_panes_whose_close_failed() -> Result<()> {
+    let (orch, ctrl) = make_orchestrator_with_retention(
+        "mock-close-failure",
+        RetentionPolicy {
+            completed_tasks: RetentionQuota::Unlimited,
+            failed_and_cancelled_tasks: RetentionQuota::Unlimited,
+            fast_task_close: FastTaskClosePolicy::FollowCompletedQuota,
+            ..RetentionPolicy::default()
+        },
+    )?;
+    orch.initialize().await?;
+    let (task_id, pane_id) =
+        run_finishing_task(&orch, &ctrl, "close-fail", "marker", Some(0)).await?;
+    let key = ManagedKey::Task(task_id);
+    let request = CleanupRequest::parse(
+        vec![CleanupScope::CompletedTasks],
+        CleanupTarget::EntireSession,
+        CleanupExecutionMode::Execute,
+    )?;
+
+    ctrl.set_close_pane_failure(ClosePaneFailure::Rejected);
+    let (failed, _) = orch.workspace_cleanup(request.clone()).await?;
+    match failed {
+        CleanupOutcome::Executed { closed, .. } => {
+            assert!(
+                closed.is_empty(),
+                "a failed close must not be reported as closed"
+            );
+        }
+        CleanupOutcome::DryRunPreview { .. } => panic!("expected execution"),
+    }
+    assert!(
+        ctrl.has_pane(pane_id),
+        "the pane must stay open after a failed close"
+    );
+    assert!(
+        orch.get_record(&key)
+            .await
+            .is_some_and(|record| !record.lifecycle.is_pane_closed()),
+        "reconcile must reopen the record so the close can be retried"
+    );
+
+    ctrl.set_close_pane_failure(ClosePaneFailure::None);
+    let (retried, _) = orch.workspace_cleanup(request).await?;
+    match retried {
+        CleanupOutcome::Executed { closed, .. } => assert_eq!(closed.len(), 1),
+        CleanupOutcome::DryRunPreview { .. } => panic!("expected execution"),
+    }
+    assert!(!ctrl.has_pane(pane_id));
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_panes_failure_keeps_the_fresh_managed_tab() -> Result<()> {
+    let (orch, ctrl) = make_orchestrator("mock-list-panes-fail", false)?;
+    orch.initialize().await?;
+    ctrl.fail_next_list_panes();
+
+    let (running, _) = orch
+        .task_run(TaskRunRequest {
+            cmd: CommandSpec::parse(vec!["sleep".into(), "60".into()])?,
+            cwd: None,
+            name: Some("bg".into()),
+            wait_timeout: Duration::from_millis(10),
+            placement: PlacementRequest::BackgroundTab,
+        })
+        .await?;
+    let (pane_id, tab_id, tab_name) = match running {
+        TaskRunOutcome::Running {
+            pane_id,
+            tab_id,
+            tab_name,
+            ..
+        } => (pane_id, tab_id, tab_name),
+        TaskRunOutcome::Completed { .. } => panic!("expected running"),
+    };
+    assert_eq!(tab_name.as_deref(), Some("agent:tasks"));
+    let panes = ctrl.panes_in_tab(tab_id);
+    assert_eq!(
+        panes.len(),
+        2,
+        "a failed pane listing must keep the tab and its placeholder, got: {panes:?}"
+    );
+    assert!(panes.iter().any(|pane| pane.pane_id == pane_id));
+    assert!(panes.iter().any(|pane| pane.title == "Shell"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn placeholder_cleanup_session_loss_propagates() -> Result<()> {
+    let (orch, ctrl) = make_orchestrator("mock-placeholder-session-loss", false)?;
+    orch.initialize().await?;
+    ctrl.set_close_pane_failure(ClosePaneFailure::SessionNotFound);
+
+    let err = orch
+        .task_run(TaskRunRequest {
+            cmd: CommandSpec::parse(vec!["sleep".into(), "60".into()])?,
+            cwd: None,
+            name: Some("bg".into()),
+            wait_timeout: Duration::from_millis(10),
+            placement: PlacementRequest::BackgroundTab,
+        })
+        .await
+        .err();
+    let Some(err) = err else {
+        panic!("expected placeholder cleanup to surface session loss");
+    };
+    assert!(matches!(
+        err.downcast_ref::<DomainError>(),
+        Some(DomainError::SessionNotFound(_))
+    ));
+
+    let err = orch.workspace_status().await.err();
+    assert!(
+        matches!(
+            err.and_then(|err| err.downcast::<DomainError>().ok()),
+            Some(DomainError::SessionNotFound(_))
+        ),
+        "the orchestrator must remember that the session died"
+    );
+    Ok(())
+}
+
 /// Runs a task whose pane finishes while `task_run` waits, then returns its pane id.
 async fn run_finishing_task(
     orch: &WorkspaceOrchestrator,
@@ -1094,20 +1417,24 @@ async fn run_finishing_task(
     label: &str,
     dump: &str,
     exit_code: Option<i32>,
-) -> Result<TerminalPaneId> {
+) -> Result<(TaskId, TerminalPaneId)> {
     let bg_ctrl = ctrl.clone();
     let orch_bg = orch.clone();
     let needle = format!(":{label}");
     let dump = dump.to_owned();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        let Some(pane_id) = bg_ctrl.find_pane_id_by_title(&needle) else {
-            return;
-        };
-        bg_ctrl.set_screen_dump(pane_id, dump);
-        orch_bg
-            .inject_event(ZellijEvent::PaneExited { pane_id, exit_code })
-            .await;
+        // Poll for the registered pane instead of guessing a fixed startup delay, which keeps the
+        // helper deterministic on a loaded test runner.
+        for _ in 0..50 {
+            if let Some(pane_id) = bg_ctrl.find_pane_id_by_title(&needle) {
+                bg_ctrl.set_screen_dump(pane_id, dump);
+                orch_bg
+                    .inject_event(ZellijEvent::PaneExited { pane_id, exit_code })
+                    .await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     });
     let command = if exit_code == Some(0) {
         "true".to_owned()
@@ -1119,18 +1446,19 @@ async fn run_finishing_task(
             cmd: CommandSpec::parse(vec![command])?,
             cwd: None,
             name: Some(label.to_owned()),
-            wait_timeout: Duration::from_millis(300),
+            wait_timeout: Duration::from_secs(1),
             placement: PlacementRequest::Auto,
         })
         .await?;
     match outcome {
         TaskRunOutcome::Completed {
+            task_id,
             pane_id,
             exit_code: seen,
             ..
         } => {
             assert_eq!(seen, exit_code);
-            Ok(pane_id)
+            Ok((task_id, pane_id))
         }
         TaskRunOutcome::Running { .. } => panic!("expected task '{label}' to finish"),
     }
