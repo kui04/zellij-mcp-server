@@ -14,6 +14,7 @@ use zellij_mcp_server::domain::layout::{
 };
 use zellij_mcp_server::mcp::server::ZellijMcpServer;
 use zellij_mcp_server::runtime::{OrchestratorConfig, WorkspaceOrchestrator};
+use zellij_mcp_server::state::{FastTaskClosePolicy, RetentionPolicy, RetentionQuota};
 use zellij_mcp_server::zellij::cli::ZellijClient;
 
 /// Zellij-backed asynchronous terminal orchestration MCP server (stdio).
@@ -43,6 +44,29 @@ struct Cli {
     /// Hard minimum row height preserved per pane when splitting vertically (0 disables).
     #[arg(long, env = "ZELLIJ_MCP_MIN_PANE_ROWS", default_value_t = DEFAULT_MIN_PANE_ROWS)]
     min_pane_rows: u16,
+
+    /// Completed task panes kept open ("0" closes immediately, N keeps the newest N,
+    /// "unlimited" never evicts).
+    #[arg(long, env = "ZELLIJ_MCP_KEEP_COMPLETED_TASKS", default_value = "1")]
+    keep_completed_tasks: RetentionQuota,
+
+    /// Failed and cancelled task panes kept open ("0", N, or "unlimited").
+    #[arg(long, env = "ZELLIJ_MCP_KEEP_FAILED_TASKS", default_value = "2")]
+    keep_failed_tasks: RetentionQuota,
+
+    /// Exited REPL panes kept open ("0", N, or "unlimited").
+    #[arg(long, env = "ZELLIJ_MCP_KEEP_EXITED_REPLS", default_value = "0")]
+    keep_exited_repls: RetentionQuota,
+
+    /// Close the pane of a task that succeeds inside the `task_run` wait window after
+    /// backfilling its logs.
+    #[arg(
+        long,
+        env = "ZELLIJ_MCP_AUTO_CLOSE_FAST_TASKS",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    auto_close_fast_tasks: bool,
 }
 
 #[tokio::main]
@@ -91,6 +115,12 @@ async fn main() -> Result<()> {
             layout_constraints: LayoutConstraints {
                 min_pane_cols: cli.min_pane_cols,
                 min_pane_rows: cli.min_pane_rows,
+            },
+            retention: RetentionPolicy {
+                completed_tasks: cli.keep_completed_tasks,
+                failed_and_cancelled_tasks: cli.keep_failed_tasks,
+                exited_repls: cli.keep_exited_repls,
+                fast_task_close: FastTaskClosePolicy::from_auto_close(cli.auto_close_fast_tasks),
             },
         },
         client,

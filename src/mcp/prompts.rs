@@ -17,7 +17,8 @@ Routing rules:
 
 Layout & observability:
 - Default to `placement=\"auto\"` (never raw x/y/width). The server enforces min pane bounds, downgrading crowded splits or headless tabs/stacks automatically; inspect `workspace_status.viewport` before overriding.
-- Keep failed task panes open (`close_pane=false`) so the human can inspect terminal output, and call `workspace_status` first when resuming or checking active services.";
+- Keep failed task panes open (`close_pane=false`) so the human can inspect terminal output, and call `workspace_status` first when resuming or checking active services.
+- Finished panes are retained by policy and trimmed automatically; call `workspace_cleanup` (optionally `dry_run`) to close them early. It never stops a running task, service, or REPL.";
 
 /// Layer 3 dynamic hint when a task exceeds the synchronous fast-path wait window.
 pub fn hint_task_running(task_id: &TaskId) -> String {

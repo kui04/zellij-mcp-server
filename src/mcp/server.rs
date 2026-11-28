@@ -1,4 +1,4 @@
-//! `rmcp 3.11.0` MCP server wiring all 12 tools, `ToolAnnotations`, and `SERVER_INSTRUCTIONS`.
+//! `rmcp 3.11.0` MCP server wiring all 13 tools, `ToolAnnotations`, and `SERVER_INSTRUCTIONS`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -11,26 +11,30 @@ use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router
 use crate::domain::error::{DomainError, ParseError};
 use crate::domain::ids::{
     CommandSpec, CompiledPattern, LogSeq, ManagedKey, PaneClosePolicy, ReplInput, ReplName,
-    ServiceName, TaskId, WaitMode,
+    ServiceName, TabId, TaskId, WaitMode,
 };
 use crate::domain::layout::PlacementRequest;
 use crate::domain::lifecycle::WorkspaceAlert;
 use crate::mcp::dto::{
-    ManagedEntityDto, PlacementDto, ReplCloseParams, ReplExecParams, ReplOpenParams, ReplResponse,
-    ServiceLogsParams, ServiceLogsResponse, ServiceRestartParams, ServiceStartParams,
-    ServiceStartResponse, ServiceStopParams, SimpleActionResponse, TaskCancelParams,
-    TaskLogsParams, TaskLogsResponse, TaskRunParams, TaskRunResponse, TaskWaitItemDto,
-    TaskWaitParams, TaskWaitResponse, ViewportDto, WaitModeDto, WorkspaceAlertDto,
-    WorkspaceStatusParams, WorkspaceStatusResponse,
+    CleanupScopeDto, ManagedEntityDto, PlacementDto, ReplCloseParams, ReplExecParams,
+    ReplOpenParams, ReplResponse, ServiceLogsParams, ServiceLogsResponse, ServiceRestartParams,
+    ServiceStartParams, ServiceStartResponse, ServiceStopParams, SimpleActionResponse,
+    TaskCancelParams, TaskLogsParams, TaskLogsResponse, TaskRunParams, TaskRunResponse,
+    TaskWaitItemDto, TaskWaitParams, TaskWaitResponse, ViewportDto, WaitModeDto, WorkspaceAlertDto,
+    WorkspaceCleanupParams, WorkspaceCleanupResponse, WorkspaceStatusParams,
+    WorkspaceStatusResponse,
 };
 use crate::mcp::prompts::{
     SERVER_INSTRUCTIONS, hint_repl_input_required, hint_service_reused, hint_task_failed,
     hint_task_running,
 };
 use crate::runtime::{
-    DEFAULT_REPL_EXEC_TIMEOUT, DEFAULT_SERVICE_READY_TIMEOUT, DEFAULT_TASK_FAST_WAIT,
-    DEFAULT_TASK_WAIT_TIMEOUT, ReplExecRequest, ReplOpenRequest, ServiceStartRequest,
-    TaskRunOutcome, TaskRunRequest, WorkspaceOrchestrator,
+    CleanupOutcome, DEFAULT_REPL_EXEC_TIMEOUT, DEFAULT_SERVICE_READY_TIMEOUT,
+    DEFAULT_TASK_FAST_WAIT, DEFAULT_TASK_WAIT_TIMEOUT, ReplExecRequest, ReplOpenRequest,
+    ServiceStartRequest, TaskRunOutcome, TaskRunRequest, WorkspaceOrchestrator,
+};
+use crate::state::{
+    CleanupExecutionMode, CleanupRequest, CleanupScope, CleanupTarget, RETENTION_HINT_THRESHOLD,
 };
 
 const MAX_TIMEOUT_MS: u64 = 3_600_000;
@@ -60,6 +64,34 @@ fn map_placement(dto: Option<PlacementDto>) -> PlacementRequest {
         PlacementDto::Stacked => PlacementRequest::Stacked,
         PlacementDto::BackgroundTab => PlacementRequest::BackgroundTab,
     }
+}
+
+fn map_cleanup_scopes(dto: Option<Vec<CleanupScopeDto>>) -> Vec<CleanupScope> {
+    let scopes = dto.unwrap_or_else(|| {
+        vec![
+            CleanupScopeDto::Completed,
+            CleanupScopeDto::Cancelled,
+            CleanupScopeDto::Exited,
+        ]
+    });
+    let mut mapped = Vec::with_capacity(scopes.len());
+    for scope in scopes {
+        match scope {
+            CleanupScopeDto::Completed => mapped.push(CleanupScope::CompletedTasks),
+            CleanupScopeDto::Failed => mapped.push(CleanupScope::FailedTasks),
+            CleanupScopeDto::Cancelled => mapped.push(CleanupScope::CancelledTasks),
+            CleanupScopeDto::Exited => mapped.push(CleanupScope::ExitedRepls),
+            CleanupScopeDto::FailedServices => mapped.push(CleanupScope::FailedServices),
+            CleanupScopeDto::AllInactive => mapped.extend([
+                CleanupScope::CompletedTasks,
+                CleanupScope::FailedTasks,
+                CleanupScope::CancelledTasks,
+                CleanupScope::ExitedRepls,
+                CleanupScope::FailedServices,
+            ]),
+        }
+    }
+    mapped
 }
 
 fn map_wait_mode(dto: Option<WaitModeDto>) -> WaitMode {
@@ -161,6 +193,13 @@ impl ZellijMcpServer {
             let _ = managed_tabs.insert("agent:services".to_owned(), tab_id.get());
         }
 
+        let hint = (snapshot.terminated_open_panes > RETENTION_HINT_THRESHOLD).then(|| {
+            format!(
+                "{} finished panes are still open; call workspace_cleanup to close them.",
+                snapshot.terminated_open_panes
+            )
+        });
+
         let entities = snapshot
             .records
             .into_iter()
@@ -191,7 +230,63 @@ impl ZellijMcpServer {
             managed_tabs,
             entities,
             alerts: map_alerts(alerts),
-            hint: None,
+            hint,
+        }))
+    }
+
+    #[tool(
+        name = "workspace_cleanup",
+        description = "Close finished task, service, and REPL panes while keeping their logs readable through task_logs/service_logs. Defaults to completed, cancelled, and exited entities; pass dry_run=true to preview. Never stops a process that still runs. Use for: a workspace crowded with finished panes. Do NOT use for: stopping running work (use task_cancel, service_stop, repl_close).",
+        annotations(destructive_hint = false, idempotent_hint = true)
+    )]
+    async fn workspace_cleanup(
+        &self,
+        Parameters(params): Parameters<WorkspaceCleanupParams>,
+    ) -> Result<Json<WorkspaceCleanupResponse>, McpError> {
+        let target = match params.tab_id {
+            Some(tab_id) => CleanupTarget::SingleTab(TabId::new(tab_id)),
+            None => CleanupTarget::EntireSession,
+        };
+        let mode = if params.dry_run.unwrap_or(false) {
+            CleanupExecutionMode::DryRun
+        } else {
+            CleanupExecutionMode::Execute
+        };
+        let request = CleanupRequest::parse(map_cleanup_scopes(params.scopes), target, mode)
+            .map_err(map_parse_err)?;
+
+        let (outcome, alerts) = self
+            .orchestrator
+            .workspace_cleanup(request)
+            .await
+            .map_err(map_runtime_err)?;
+
+        let (dry_run, panes, skipped_active_count) = match outcome {
+            CleanupOutcome::DryRunPreview {
+                would_close,
+                skipped_active_count,
+            } => (true, would_close, skipped_active_count),
+            CleanupOutcome::Executed {
+                closed,
+                skipped_active_count,
+            } => (false, closed, skipped_active_count),
+        };
+        let entities = panes
+            .iter()
+            .map(|pane| pane.key().to_string())
+            .collect::<Vec<_>>();
+        let hint = (dry_run && !panes.is_empty()).then(|| {
+            "dry_run only previews; call workspace_cleanup again without dry_run to close these panes."
+                .to_owned()
+        });
+
+        Ok(Json(WorkspaceCleanupResponse {
+            dry_run,
+            pane_count: panes.len(),
+            entities,
+            skipped_active_count,
+            alerts: map_alerts(alerts),
+            hint,
         }))
     }
 

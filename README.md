@@ -6,10 +6,10 @@ long-lived background services, and stateful interactive REPL sessions inside re
 
 ## Features
 
-- **12 high-level MCP tools** covering finite commands (`task_run`, `task_wait`, `task_logs`,
+- **13 high-level MCP tools** covering finite commands (`task_run`, `task_wait`, `task_logs`,
   `task_cancel`), long-lived services (`service_start`, `service_logs`, `service_restart`,
   `service_stop`), interactive REPLs (`repl_open`, `repl_exec`, `repl_close`), and workspace
-  inspection (`workspace_status`).
+  inspection and cleanup (`workspace_status`, `workspace_cleanup`).
 - **Event-driven waiting**: uses `zellij events` and `zellij subscribe` to block server-side until
   commands exit, readiness regexes match, or REPL prompts return, avoiding LLM sleep/poll loops.
 - **Incremental, ANSI-stripped logs**: maintains bounded per-entity log buffers with `since_seq`
@@ -21,6 +21,9 @@ long-lived background services, and stateful interactive REPL sessions inside re
   `$ZELLIJ_SESSION_NAME` without tearing down user-owned sessions; when started outside Zellij,
   creates a unique `mcp-<cwd>-<hex>` session and cleans it up on exit unless `--keep-session` is
   set.
+- **Bounded pane retention**: finished task, service, and REPL panes close on per-class quotas (or
+  on `workspace_cleanup`), and scrollback is backfilled first so `task_logs` / `service_logs` keep
+  working after the pane is gone.
 - **Optional human confirmation gate**: `--confirm-destructive` gates `task_cancel`, `service_stop`,
   and `repl_close` behind `zellij prompt confirm`.
 
@@ -62,15 +65,19 @@ zellij-mcp-server [OPTIONS]
 
 ### CLI flags and environment variables
 
-| Flag                     | Environment Variable       | Default  | Description                                                                            |
-| ------------------------ | -------------------------- | -------- | -------------------------------------------------------------------------------------- |
-| `--session <SESSION>`    | `ZELLIJ_MCP_SESSION`       | Auto     | Target Zellij session name (overrides `$ZELLIJ_SESSION_NAME`).                         |
-| `--zellij-bin <PATH>`    | `ZELLIJ_BIN`               | `zellij` | Path to the `zellij` executable (`>= 0.46.1`).                                         |
-| `--confirm-destructive`  | -                          | `false`  | Prompt via `zellij prompt confirm` before `task_cancel`, `service_stop`, `repl_close`. |
-| `--keep-session`         | -                          | `false`  | Keep a server-created Zellij session alive after the MCP server exits.                 |
-| `--min-pane-cols <COLS>` | `ZELLIJ_MCP_MIN_PANE_COLS` | `80`     | Hard minimum columns per pane on horizontal split (`0` disables).                      |
-| `--min-pane-rows <ROWS>` | `ZELLIJ_MCP_MIN_PANE_ROWS` | `16`     | Hard minimum rows per pane on vertical split (`0` disables).                           |
-| -                        | `RUST_LOG`                 | -        | Standard `tracing_subscriber` filter (logs are emitted to `stderr`).                   |
+| Flag                             | Environment Variable               | Default  | Description                                                                            |
+| -------------------------------- | ---------------------------------- | -------- | -------------------------------------------------------------------------------------- |
+| `--session <SESSION>`            | `ZELLIJ_MCP_SESSION`               | Auto     | Target Zellij session name (overrides `$ZELLIJ_SESSION_NAME`).                         |
+| `--zellij-bin <PATH>`            | `ZELLIJ_BIN`                       | `zellij` | Path to the `zellij` executable (`>= 0.46.1`).                                         |
+| `--confirm-destructive`          | -                                  | `false`  | Prompt via `zellij prompt confirm` before `task_cancel`, `service_stop`, `repl_close`. |
+| `--keep-session`                 | -                                  | `false`  | Keep a server-created Zellij session alive after the MCP server exits.                 |
+| `--min-pane-cols <COLS>`         | `ZELLIJ_MCP_MIN_PANE_COLS`         | `80`     | Hard minimum columns per pane on horizontal split (`0` disables).                      |
+| `--min-pane-rows <ROWS>`         | `ZELLIJ_MCP_MIN_PANE_ROWS`         | `16`     | Hard minimum rows per pane on vertical split (`0` disables).                           |
+| `--keep-completed-tasks <QUOTA>` | `ZELLIJ_MCP_KEEP_COMPLETED_TASKS`  | `1`      | Completed task panes kept open: `0`, N, or `unlimited`.                                |
+| `--keep-failed-tasks <QUOTA>`    | `ZELLIJ_MCP_KEEP_FAILED_TASKS`     | `2`      | Failed and cancelled task panes kept open: `0`, N, or `unlimited`.                     |
+| `--keep-exited-repls <QUOTA>`    | `ZELLIJ_MCP_KEEP_EXITED_REPLS`     | `0`      | Exited REPL panes kept open: `0`, N, or `unlimited`.                                   |
+| `--auto-close-fast-tasks <BOOL>` | `ZELLIJ_MCP_AUTO_CLOSE_FAST_TASKS` | `true`   | Close the pane of a task that succeeds inside the `task_run` wait window.              |
+| -                                | `RUST_LOG`                         | -        | Standard `tracing_subscriber` filter (logs are emitted to `stderr`).                   |
 
 Session resolution precedence at startup:
 
@@ -103,9 +110,10 @@ Add `zellij-mcp-server` to your MCP client configuration (for example `.pi/mcp.j
 
 ### Workspace
 
-| Tool               | Parameters | Description                                                                                                                                                                         |
-| ------------------ | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `workspace_status` | `session?` | Lists managed tasks, services, and REPLs (each with `pane_closed`), live viewport dimensions, `layout_tier`, `managed_tabs`, and `attach_command`. Retains up to 50 closed records. |
+| Tool                | Parameters                       | Description                                                                                                                                                                                                                                                                 |
+| ------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `workspace_status`  | `session?`                       | Lists managed tasks, services, and REPLs (each with `pane_closed`), live viewport dimensions, `layout_tier`, `managed_tabs`, and `attach_command`. Retains up to 50 closed records, and hints at `workspace_cleanup` once more than 4 finished panes stay open.             |
+| `workspace_cleanup` | `scopes?`, `tab_id?`, `dry_run?` | Closes finished panes while keeping their logs readable. `scopes` defaults to `["completed", "cancelled", "exited"]`; also accepts `failed`, `failed_services`, and `all_inactive`. Never touches running entities, and `dry_run = true` previews without closing anything. |
 
 ### Tasks (finite commands with exit codes)
 

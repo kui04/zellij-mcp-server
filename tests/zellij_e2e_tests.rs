@@ -15,6 +15,7 @@ use zellij_mcp_server::runtime::{
     OrchestratorConfig, ReplExecRequest, ReplOpenRequest, ServiceStartRequest, TaskRunOutcome,
     TaskRunRequest, WorkspaceOrchestrator,
 };
+use zellij_mcp_server::state::RetentionPolicy;
 use zellij_mcp_server::zellij::cli::ZellijClient;
 
 struct SessionCleanupGuard {
@@ -51,6 +52,7 @@ async fn real_zellij_task_service_and_repl_end_to_end() -> Result<()> {
             keep_session: false,
             default_cwd: std::env::current_dir()?,
             layout_constraints: LayoutConstraints::default(),
+            retention: RetentionPolicy::default(),
         },
         client.clone(),
     );
@@ -68,6 +70,7 @@ async fn real_zellij_task_service_and_repl_end_to_end() -> Result<()> {
             keep_session: false,
             default_cwd: std::env::current_dir()?,
             layout_constraints: LayoutConstraints::default(),
+            retention: RetentionPolicy::default(),
         },
         client.clone(),
     );

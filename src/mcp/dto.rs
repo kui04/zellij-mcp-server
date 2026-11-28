@@ -1,4 +1,4 @@
-//! Wire DTOs and JSON Schema definitions for all 12 MCP tools.
+//! Wire DTOs and JSON Schema definitions for all 13 MCP tools.
 
 use std::collections::BTreeMap;
 
@@ -317,4 +317,46 @@ pub struct ReplResponse {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReplCloseParams {
     pub name: String,
+}
+
+/// Cleanup scope accepted by `workspace_cleanup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupScopeDto {
+    /// Task panes that exited with code 0.
+    Completed,
+    /// Panes of tasks that exited with a non-zero code.
+    Failed,
+    /// Panes of tasks that were cancelled and kept open.
+    Cancelled,
+    /// Panes of REPLs that exited on their own.
+    Exited,
+    /// Panes of services that failed or were stopped without closing their pane.
+    FailedServices,
+    /// Every finished pane with an open pane, in any of the scopes above.
+    AllInactive,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct WorkspaceCleanupParams {
+    /// Scopes to clean; omitted means `["completed", "cancelled", "exited"]`.
+    pub scopes: Option<Vec<CleanupScopeDto>>,
+    /// Restrict cleanup to one Zellij tab id (default: the whole session).
+    pub tab_id: Option<u32>,
+    /// Preview the panes that would be closed without closing them (default: false).
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct WorkspaceCleanupResponse {
+    pub dry_run: bool,
+    pub pane_count: usize,
+    /// Managed entity identifiers ("task:t_01", "svc:web-dev", "repl:py").
+    pub entities: Vec<String>,
+    /// Running entities of the requested kinds that cleanup deliberately left alone.
+    pub skipped_active_count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub alerts: Vec<WorkspaceAlertDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }

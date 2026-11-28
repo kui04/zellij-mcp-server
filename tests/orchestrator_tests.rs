@@ -13,10 +13,13 @@ use zellij_mcp_server::domain::ids::{
 };
 use zellij_mcp_server::domain::layout::{LayoutConstraints, PlacementRequest, ResolvedPlacement};
 use zellij_mcp_server::runtime::{
-    OrchestratorConfig, ReplExecRequest, ReplOpenRequest, ServiceStartRequest, TaskRunOutcome,
-    TaskRunRequest, WorkspaceOrchestrator,
+    CleanupOutcome, OrchestratorConfig, ReplExecRequest, ReplOpenRequest, ServiceStartRequest,
+    TaskRunOutcome, TaskRunRequest, WorkspaceOrchestrator,
 };
-use zellij_mcp_server::state::ZellijEvent;
+use zellij_mcp_server::state::{
+    CleanupExecutionMode, CleanupRequest, CleanupScope, CleanupTarget, FastTaskClosePolicy,
+    RetentionPolicy, RetentionQuota, ZellijEvent,
+};
 use zellij_mcp_server::zellij::cli::ZellijClient;
 use zellij_mcp_server::zellij::protocol::SubscribeFrame;
 
@@ -28,6 +31,29 @@ fn make_orchestrator(
     zellij_mcp_server::zellij::cli::mock::MockZellijCtrl,
 )> {
     make_orchestrator_with_keep(session, confirm_destructive, false)
+}
+
+fn make_orchestrator_with_retention(
+    session: &str,
+    retention: RetentionPolicy,
+) -> Result<(
+    WorkspaceOrchestrator,
+    zellij_mcp_server::zellij::cli::mock::MockZellijCtrl,
+)> {
+    let session_name = SessionName::parse(session)?;
+    let (client, ctrl) = ZellijClient::new_mocked(session_name.clone());
+    let orch = WorkspaceOrchestrator::new(
+        OrchestratorConfig {
+            session_resolution: SessionResolution::Explicit(session_name),
+            confirm_destructive: false,
+            keep_session: false,
+            default_cwd: PathBuf::from("."),
+            layout_constraints: LayoutConstraints::default(),
+            retention,
+        },
+        client,
+    );
+    Ok((orch, ctrl))
 }
 
 fn make_orchestrator_with_keep(
@@ -47,6 +73,7 @@ fn make_orchestrator_with_keep(
             keep_session,
             default_cwd: PathBuf::from("."),
             layout_constraints: LayoutConstraints::default(),
+            retention: RetentionPolicy::default(),
         },
         client,
     );
@@ -847,4 +874,264 @@ async fn failed_spawn_never_closes_the_fresh_tab_placeholder() -> Result<()> {
         ctrl.recorded_actions()
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn fast_successful_task_closes_its_pane_and_keeps_logs_readable() -> Result<()> {
+    let (orch, ctrl) = make_orchestrator("mock-fast-close", false)?;
+    orch.initialize().await?;
+
+    ctrl.set_screen_dump(TerminalPaneId::new(1), "fast-out");
+    let orch_bg = orch.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        orch_bg
+            .inject_event(ZellijEvent::PaneExited {
+                pane_id: TerminalPaneId::new(1),
+                exit_code: Some(0),
+            })
+            .await;
+    });
+
+    let (outcome, _) = orch
+        .task_run(TaskRunRequest {
+            cmd: CommandSpec::parse(vec!["echo".into(), "fast-out".into()])?,
+            cwd: None,
+            name: Some("fast".into()),
+            wait_timeout: Duration::from_millis(500),
+            placement: PlacementRequest::Auto,
+        })
+        .await?;
+
+    let task_id = match outcome {
+        TaskRunOutcome::Completed {
+            task_id,
+            status,
+            output,
+            ..
+        } => {
+            assert_eq!(status, "completed");
+            assert!(output.contains("fast-out"));
+            task_id
+        }
+        TaskRunOutcome::Running { .. } => panic!("expected fast-path completion"),
+    };
+
+    assert!(
+        ctrl.recorded_actions()
+            .iter()
+            .any(|action| action.starts_with("close_pane:")),
+        "expected the fast task pane to be closed, got: {:?}",
+        ctrl.recorded_actions()
+    );
+    assert!(
+        !ctrl.has_pane(TerminalPaneId::new(1)),
+        "the closed pane must be gone from Zellij"
+    );
+    assert!(
+        ctrl.has_pane(TerminalPaneId::new(0)),
+        "unrelated panes must stay open"
+    );
+
+    // The scrollback was backfilled before closing, so task_logs still answers.
+    let (logs, _) = orch.task_logs(&task_id, 10, None).await?;
+    assert!(logs.pane_closed);
+    assert!(logs.output.contains("fast-out"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fast_task_close_policy_can_follow_the_completed_quota() -> Result<()> {
+    let (orch, ctrl) = make_orchestrator_with_retention(
+        "mock-fast-keep",
+        RetentionPolicy {
+            completed_tasks: RetentionQuota::keep(2),
+            fast_task_close: FastTaskClosePolicy::FollowCompletedQuota,
+            ..RetentionPolicy::default()
+        },
+    )?;
+    orch.initialize().await?;
+
+    // Three fast tasks: each pane appears under its own managed title, so the exit event can
+    // target the right pane regardless of which tab the layout router chose.
+    let mut panes = Vec::new();
+    for seq in 1..=3u32 {
+        let bg_ctrl = ctrl.clone();
+        let orch_bg = orch.clone();
+        let title = format!("mcp:task:t_0{seq}");
+        let dump = format!("out-{seq}");
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let Some(pane_id) = bg_ctrl.find_pane_id_by_title(&title) else {
+                return;
+            };
+            bg_ctrl.set_screen_dump(pane_id, dump);
+            orch_bg
+                .inject_event(ZellijEvent::PaneExited {
+                    pane_id,
+                    exit_code: Some(0),
+                })
+                .await;
+        });
+        let (outcome, _) = orch
+            .task_run(TaskRunRequest {
+                cmd: CommandSpec::parse(vec!["echo".into(), format!("out-{seq}")])?,
+                cwd: None,
+                name: Some(format!("job-{seq}")),
+                wait_timeout: Duration::from_millis(300),
+                placement: PlacementRequest::SplitRight,
+            })
+            .await?;
+        match outcome {
+            TaskRunOutcome::Completed { pane_id, .. } => panes.push(pane_id),
+            TaskRunOutcome::Running { .. } => panic!("expected task {seq} to complete"),
+        }
+    }
+
+    assert!(
+        !ctrl.has_pane(panes[0]),
+        "only the oldest completed pane exceeds the keep-2 quota"
+    );
+    assert!(ctrl.has_pane(panes[1]) && ctrl.has_pane(panes[2]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn workspace_cleanup_previews_and_closes_only_finished_panes() -> Result<()> {
+    let (orch, ctrl) = make_orchestrator_with_retention(
+        "mock-cleanup",
+        RetentionPolicy {
+            completed_tasks: RetentionQuota::Unlimited,
+            failed_and_cancelled_tasks: RetentionQuota::Unlimited,
+            fast_task_close: FastTaskClosePolicy::FollowCompletedQuota,
+            ..RetentionPolicy::default()
+        },
+    )?;
+    orch.initialize().await?;
+
+    // A completed task whose pane stays open (fast close follows the completed quota here).
+    let done_pane = run_finishing_task(&orch, &ctrl, "done", "marker", Some(0)).await?;
+    // A failed task whose pane also stays open.
+    let failed_pane = run_finishing_task(&orch, &ctrl, "boom", "boom", Some(2)).await?;
+
+    // A still-running task that cleanup must never touch.
+    let (running, _) = orch
+        .task_run(TaskRunRequest {
+            cmd: CommandSpec::parse(vec!["sleep".into(), "60".into()])?,
+            cwd: None,
+            name: Some("alive".into()),
+            wait_timeout: Duration::from_millis(10),
+            placement: PlacementRequest::SplitRight,
+        })
+        .await?;
+    let alive_pane = match running {
+        TaskRunOutcome::Running { pane_id, .. } => pane_id,
+        TaskRunOutcome::Completed { .. } => panic!("expected running"),
+    };
+
+    let dry_run = CleanupRequest::parse(
+        vec![CleanupScope::CompletedTasks, CleanupScope::FailedTasks],
+        CleanupTarget::EntireSession,
+        CleanupExecutionMode::DryRun,
+    )?;
+    let (preview, _) = orch.workspace_cleanup(dry_run).await?;
+    match preview {
+        CleanupOutcome::DryRunPreview {
+            would_close,
+            skipped_active_count,
+        } => {
+            assert_eq!(would_close.len(), 2);
+            assert_eq!(skipped_active_count, 1);
+        }
+        CleanupOutcome::Executed { .. } => panic!("expected a dry-run preview"),
+    }
+    assert!(
+        ctrl.has_pane(done_pane) && ctrl.has_pane(failed_pane),
+        "dry_run must not close anything, got: {:?}",
+        ctrl.recorded_actions()
+    );
+
+    let execute = CleanupRequest::parse(
+        vec![CleanupScope::CompletedTasks, CleanupScope::FailedTasks],
+        CleanupTarget::EntireSession,
+        CleanupExecutionMode::Execute,
+    )?;
+    let (outcome, _) = orch.workspace_cleanup(execute).await?;
+    match outcome {
+        CleanupOutcome::Executed {
+            closed,
+            skipped_active_count,
+        } => {
+            assert_eq!(closed.len(), 2);
+            assert_eq!(skipped_active_count, 1);
+        }
+        CleanupOutcome::DryRunPreview { .. } => panic!("expected execution"),
+    }
+    assert!(
+        ctrl.has_pane(alive_pane),
+        "the running task must never be closed by cleanup"
+    );
+    assert!(!ctrl.has_pane(done_pane) && !ctrl.has_pane(failed_pane));
+
+    // A second run finds nothing left to close.
+    let again = CleanupRequest::parse(
+        vec![CleanupScope::CompletedTasks, CleanupScope::FailedTasks],
+        CleanupTarget::EntireSession,
+        CleanupExecutionMode::Execute,
+    )?;
+    let (outcome, _) = orch.workspace_cleanup(again).await?;
+    match outcome {
+        CleanupOutcome::Executed { closed, .. } => assert!(closed.is_empty()),
+        CleanupOutcome::DryRunPreview { .. } => panic!("expected execution"),
+    }
+    Ok(())
+}
+
+/// Runs a task whose pane finishes while `task_run` waits, then returns its pane id.
+async fn run_finishing_task(
+    orch: &WorkspaceOrchestrator,
+    ctrl: &zellij_mcp_server::zellij::cli::mock::MockZellijCtrl,
+    label: &str,
+    dump: &str,
+    exit_code: Option<i32>,
+) -> Result<TerminalPaneId> {
+    let bg_ctrl = ctrl.clone();
+    let orch_bg = orch.clone();
+    let needle = format!(":{label}");
+    let dump = dump.to_owned();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let Some(pane_id) = bg_ctrl.find_pane_id_by_title(&needle) else {
+            return;
+        };
+        bg_ctrl.set_screen_dump(pane_id, dump);
+        orch_bg
+            .inject_event(ZellijEvent::PaneExited { pane_id, exit_code })
+            .await;
+    });
+    let command = if exit_code == Some(0) {
+        "true".to_owned()
+    } else {
+        "false".to_owned()
+    };
+    let (outcome, _) = orch
+        .task_run(TaskRunRequest {
+            cmd: CommandSpec::parse(vec![command])?,
+            cwd: None,
+            name: Some(label.to_owned()),
+            wait_timeout: Duration::from_millis(300),
+            placement: PlacementRequest::Auto,
+        })
+        .await?;
+    match outcome {
+        TaskRunOutcome::Completed {
+            pane_id,
+            exit_code: seen,
+            ..
+        } => {
+            assert_eq!(seen, exit_code);
+            Ok(pane_id)
+        }
+        TaskRunOutcome::Running { .. } => panic!("expected task '{label}' to finish"),
+    }
 }

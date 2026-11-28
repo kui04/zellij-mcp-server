@@ -32,7 +32,9 @@ use crate::logs::{
 };
 use crate::runtime::cache::{CachedPaneEntry, SessionCache, load_cache, remove_cache, save_cache};
 use crate::state::{
-    ManagedRecord, ObservedPane, ReconciliationSnapshot, StateStore, TransitionEffects, ZellijEvent,
+    CleanupExecutionMode, CleanupRequest, EvictablePane, EvictionReason, FastTaskClosePolicy,
+    ManagedRecord, ObservedPane, ReconciliationSnapshot, RetentionPolicy, StateStore,
+    TransitionEffects, ZellijEvent,
 };
 use crate::zellij::cli::{NewPaneSpec, SessionAttachment, ZellijClient};
 use crate::zellij::protocol::SubscribeFrame;
@@ -75,6 +77,7 @@ pub struct OrchestratorConfig {
     pub keep_session: bool,
     pub default_cwd: PathBuf,
     pub layout_constraints: LayoutConstraints,
+    pub retention: RetentionPolicy,
 }
 
 /// Request payload for `task_run` after boundary parsing.
@@ -209,6 +212,21 @@ pub struct StateSnapshot {
     pub session_resolution: SessionResolution,
     pub layout: crate::domain::layout::LayoutState,
     pub records: Vec<ManagedRecord>,
+    /// Finished entities whose pane is still open; drives the cleanup hint.
+    pub terminated_open_panes: usize,
+}
+
+/// Result of `workspace_cleanup`, keeping preview and execution apart.
+#[derive(Debug, Clone)]
+pub enum CleanupOutcome {
+    DryRunPreview {
+        would_close: Vec<EvictablePane>,
+        skipped_active_count: usize,
+    },
+    Executed {
+        closed: Vec<EvictablePane>,
+        skipped_active_count: usize,
+    },
 }
 
 /// Cloneable async orchestrator (`M-SERVICES-CLONE`).
@@ -367,12 +385,13 @@ pub enum ProvisionedTab {
 impl WorkspaceOrchestrator {
     pub fn new(config: OrchestratorConfig, client: ZellijClient) -> Self {
         let session = config.session_resolution.session_name().clone();
+        let retention = config.retention;
         let (state_gen, _) = watch::channel(0u64);
         Self {
             inner: Arc::new(OrchestratorInner {
                 config,
                 client,
-                state: RwLock::new(StateStore::new(session)),
+                state: RwLock::new(StateStore::new(session, retention)),
                 pane_write_locks: Mutex::new(HashMap::new()),
                 provision_lock: Mutex::new(()),
                 state_gen,
@@ -1103,8 +1122,49 @@ impl WorkspaceOrchestrator {
             session_resolution: self.inner.config.session_resolution.clone(),
             layout: store.layout.clone(),
             records: store.all_records().cloned().collect(),
+            terminated_open_panes: store.count_terminated_open_panes(),
         };
         Ok((snapshot, alerts))
+    }
+
+    /// Closes finished panes addressed by `request`, or previews them when it is a dry run.
+    ///
+    /// Reconciles first so panes the human already closed are not selected again and do not make
+    /// the returned `closed` list claim panes that no longer exist.
+    pub async fn workspace_cleanup(
+        &self,
+        request: CleanupRequest,
+    ) -> Result<(CleanupOutcome, Vec<WorkspaceAlert>)> {
+        self.ensure_session_alive().await?;
+        self.reconcile_now().await?;
+
+        let (selected, skipped_active_count) = {
+            let store = self.inner.state.read().await;
+            (
+                store.select_panes_for_cleanup(&request),
+                store.count_skipped_active(&request),
+            )
+        };
+
+        let outcome = match request.mode {
+            CleanupExecutionMode::DryRun => CleanupOutcome::DryRunPreview {
+                would_close: selected,
+                skipped_active_count,
+            },
+            CleanupExecutionMode::Execute => {
+                let effects = {
+                    let mut store = self.inner.state.write().await;
+                    store.mark_evicted(&selected)
+                };
+                self.apply_effects(effects).await;
+                CleanupOutcome::Executed {
+                    closed: selected,
+                    skipped_active_count,
+                }
+            }
+        };
+        let alerts = self.inner.state.write().await.drain_alerts();
+        Ok((outcome, alerts))
     }
 
     pub async fn task_run(
@@ -1174,15 +1234,35 @@ impl WorkspaceOrchestrator {
             // Mark current generation seen BEFORE checking state so no update can be lost.
             let _ = *gen_rx.borrow_and_update();
             {
-                let store = self.inner.state.read().await;
-                if let Some(rec) = store.get(&key)
-                    && !rec.lifecycle.is_active()
-                {
-                    let status = rec.lifecycle.status_label();
-                    let exit_code = rec.lifecycle.exit_code();
-                    let title = rec.pane_title.clone();
-                    drop(store);
+                let terminal = {
+                    let store = self.inner.state.read().await;
+                    store
+                        .get(&key)
+                        .filter(|rec| !rec.lifecycle.is_active())
+                        .map(|rec| {
+                            (
+                                rec.lifecycle.status_label(),
+                                rec.lifecycle.exit_code(),
+                                rec.pane_title.clone(),
+                            )
+                        })
+                };
+                if let Some((status, exit_code, title)) = terminal {
+                    let close_now = exit_code == Some(0)
+                        && self.inner.config.retention.fast_task_close
+                            == FastTaskClosePolicy::CloseAfterBackfill;
+                    let evicted = if close_now {
+                        let mut store = self.inner.state.write().await;
+                        store.mark_fast_task_for_close(&key)
+                    } else {
+                        None
+                    };
+                    // Snapshot the scrollback before closing so `task_logs` keeps working.
                     let output = self.read_task_output_truncated(pane_id, &key).await;
+                    if let Some(pane) = evicted {
+                        self.apply_effects(TransitionEffects::close_pane(pane.pane_id()))
+                            .await;
+                    }
                     let alerts = self.inner.state.write().await.drain_alerts();
                     return Ok((
                         TaskRunOutcome::Completed {
@@ -1481,9 +1561,9 @@ impl WorkspaceOrchestrator {
             }
         }
 
-        let final_status = {
+        let (final_status, retention_effects) = {
             let mut store = self.inner.state.write().await;
-            if let Some(rec) = store.get_mut(&key) {
+            let status = if let Some(rec) = store.get_mut(&key) {
                 if was_active {
                     let started_at = rec.lifecycle.started_at();
                     let exit_code = rec.lifecycle.exit_code();
@@ -1515,8 +1595,12 @@ impl WorkspaceOrchestrator {
                 rec.lifecycle.status_label().to_owned()
             } else {
                 "stopped".to_owned()
-            }
+            };
+            // Cancelled panes kept open fall under the failed/cancelled retention quota.
+            let effects = store.enforce_retention(EvictionReason::RetentionGc);
+            (status, effects)
         };
+        self.apply_effects(retention_effects).await;
 
         if pane_closed {
             let _ = self

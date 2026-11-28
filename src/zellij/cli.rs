@@ -923,6 +923,14 @@ pub mod mock {
                 .map(|pane| pane.pane_id)
         }
 
+        /// Whether `pane_id` is still open (mirrors `list-panes --all`).
+        pub fn has_pane(&self, pane_id: TerminalPaneId) -> bool {
+            self.lock_state()
+                .panes
+                .iter()
+                .any(|pane| pane.pane_id == pane_id)
+        }
+
         /// Returns the live panes of `tab_id` (mirrors `list-panes --all`).
         pub fn panes_in_tab(&self, tab_id: TabId) -> Vec<ObservedPane> {
             self.lock_state()

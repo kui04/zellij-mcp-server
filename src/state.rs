@@ -1,10 +1,12 @@
 //! Pure in-memory state projection (`StateStore`) driven by Zellij events and reconciliation.
 
 use std::collections::{HashMap, HashSet};
-use std::num::NonZeroI32;
+use std::num::{NonZeroI32, NonZeroUsize};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::SystemTime;
 
+use crate::domain::error::ParseError;
 use crate::domain::ids::{
     CommandSpec, CompiledPattern, ManagedKey, PaneTitleCodec, ReplName, ServiceName, SessionName,
     TabId, TaskId, TerminalPaneId,
@@ -19,10 +21,10 @@ use crate::domain::lifecycle::{
 };
 use crate::logs::{BoundedLogBuffer, diff_viewport, strip_ansi};
 
-/// Number of recently completed task panes kept open before automatic GC.
-pub const MAX_RETAINED_COMPLETED_TASKS: usize = 5;
 /// Maximum number of closed terminal records retained in memory for historical inspection.
 pub const MAX_RETAINED_CLOSED_RECORDS: usize = 50;
+/// Open finished panes above which `workspace_status` suggests running `workspace_cleanup`.
+pub const RETENTION_HINT_THRESHOLD: usize = 4;
 /// Maximum number of buffered early exit/close events for panes not yet registered.
 const MAX_EARLY_EVENT_BUFFER: usize = 64;
 
@@ -31,6 +33,294 @@ const FALLBACK_NONZERO_EXIT: NonZeroI32 = match NonZeroI32::new(1) {
     Some(code) => code,
     None => unreachable!(),
 };
+
+/// How many recently finished panes of one class stay open.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RetentionQuota {
+    /// Close the pane as soon as the entity reaches its terminal state.
+    #[default]
+    CloseImmediately,
+    /// Keep the newest N finished panes open and evict older ones.
+    KeepLatest(NonZeroUsize),
+    /// Never evict automatically.
+    Unlimited,
+}
+
+impl RetentionQuota {
+    /// Parses `"0"`, a positive integer, or `"unlimited"`. Rejects negative numbers, empty
+    /// strings, and unknown words at the boundary so the core never sees an ambiguous quota.
+    pub fn parse(raw: &str) -> Result<Self, ParseError> {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("unlimited") {
+            return Ok(Self::Unlimited);
+        }
+        let count: usize = trimmed
+            .parse()
+            .map_err(|_| ParseError::InvalidRetentionQuota {
+                raw: trimmed.to_owned(),
+            })?;
+        Ok(Self::keep(count))
+    }
+
+    /// Builds a quota from a literal count; `0` closes immediately.
+    pub const fn keep(count: usize) -> Self {
+        match NonZeroUsize::new(count) {
+            Some(count) => Self::KeepLatest(count),
+            None => Self::CloseImmediately,
+        }
+    }
+
+    /// Number of panes to keep open, or `None` when the quota is unlimited.
+    const fn keep_count(self) -> Option<usize> {
+        match self {
+            Self::CloseImmediately => Some(0),
+            Self::KeepLatest(count) => Some(count.get()),
+            Self::Unlimited => None,
+        }
+    }
+}
+
+impl FromStr for RetentionQuota {
+    type Err = ParseError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::parse(raw)
+    }
+}
+
+/// What happens to a task that finished within the `task_run` fast-path wait window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastTaskClosePolicy {
+    /// Snapshot the full scrollback, then close the pane so short commands leave no trace on the
+    /// screen; logs stay readable through `task_logs`.
+    CloseAfterBackfill,
+    /// Leave the pane to the completed-task quota.
+    FollowCompletedQuota,
+}
+
+impl FastTaskClosePolicy {
+    pub const fn from_auto_close(enabled: bool) -> Self {
+        if enabled {
+            Self::CloseAfterBackfill
+        } else {
+            Self::FollowCompletedQuota
+        }
+    }
+}
+
+/// Per-class pane retention limits applied after every terminal lifecycle transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    pub completed_tasks: RetentionQuota,
+    pub failed_and_cancelled_tasks: RetentionQuota,
+    pub exited_repls: RetentionQuota,
+    pub fast_task_close: FastTaskClosePolicy,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            completed_tasks: RetentionQuota::KeepLatest(NonZeroUsize::MIN),
+            failed_and_cancelled_tasks: RetentionQuota::KeepLatest(match NonZeroUsize::new(2) {
+                Some(count) => count,
+                None => unreachable!(),
+            }),
+            exited_repls: RetentionQuota::CloseImmediately,
+            fast_task_close: FastTaskClosePolicy::CloseAfterBackfill,
+        }
+    }
+}
+
+/// Why a pane was selected for closing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionReason {
+    RetentionGc,
+    FastPathAutoClose,
+    ExplicitCleanup,
+}
+
+/// Proof that a managed pane is finished and still open, so closing it cannot kill a process.
+///
+/// Fields are private: only [`StateStore`] builds one, after checking that the lifecycle is
+/// terminal and the pane is still open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvictablePane {
+    key: ManagedKey,
+    pane_id: TerminalPaneId,
+    tab_id: TabId,
+    reason: EvictionReason,
+}
+
+impl EvictablePane {
+    pub fn key(&self) -> &ManagedKey {
+        &self.key
+    }
+
+    pub const fn pane_id(&self) -> TerminalPaneId {
+        self.pane_id
+    }
+
+    pub const fn tab_id(&self) -> TabId {
+        self.tab_id
+    }
+
+    pub const fn reason(&self) -> EvictionReason {
+        self.reason
+    }
+}
+
+/// Which class of finished panes a retention quota governs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetentionClass {
+    CompletedTasks,
+    FailedAndCancelledTasks,
+    ExitedRepls,
+}
+
+impl RetentionClass {
+    const fn matches(self, lifecycle: &EntityLifecycle) -> bool {
+        matches!(
+            (self, lifecycle),
+            (
+                Self::CompletedTasks,
+                EntityLifecycle::Task(TaskLifecycle::Completed {
+                    pane_closed: false,
+                    ..
+                }),
+            ) | (
+                Self::FailedAndCancelledTasks,
+                EntityLifecycle::Task(
+                    TaskLifecycle::Failed {
+                        pane_closed: false,
+                        ..
+                    } | TaskLifecycle::Cancelled {
+                        pane_closed: false,
+                        ..
+                    },
+                ),
+            ) | (
+                Self::ExitedRepls,
+                EntityLifecycle::Repl(ReplLifecycle::Exited {
+                    pane_closed: false,
+                    ..
+                }),
+            )
+        )
+    }
+}
+
+/// Class of finished panes addressed by `workspace_cleanup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CleanupScope {
+    CompletedTasks,
+    FailedTasks,
+    CancelledTasks,
+    ExitedRepls,
+    /// Services that failed or were stopped while their pane stayed open.
+    FailedServices,
+}
+
+impl CleanupScope {
+    const fn matches(self, lifecycle: &EntityLifecycle) -> bool {
+        matches!(
+            (self, lifecycle),
+            (
+                Self::CompletedTasks,
+                EntityLifecycle::Task(TaskLifecycle::Completed {
+                    pane_closed: false,
+                    ..
+                }),
+            ) | (
+                Self::FailedTasks,
+                EntityLifecycle::Task(TaskLifecycle::Failed {
+                    pane_closed: false,
+                    ..
+                }),
+            ) | (
+                Self::CancelledTasks,
+                EntityLifecycle::Task(TaskLifecycle::Cancelled {
+                    pane_closed: false,
+                    ..
+                }),
+            ) | (
+                Self::ExitedRepls,
+                EntityLifecycle::Repl(ReplLifecycle::Exited {
+                    pane_closed: false,
+                    ..
+                }),
+            ) | (
+                Self::FailedServices,
+                EntityLifecycle::Service(
+                    ServiceLifecycle::Failed {
+                        pane_closed: false,
+                        ..
+                    } | ServiceLifecycle::Stopped {
+                        pane_closed: false,
+                        ..
+                    },
+                ),
+            )
+        )
+    }
+
+    /// Whether an active entity of the same kind would be protected by this scope.
+    const fn covers_kind(self, lifecycle: &EntityLifecycle) -> bool {
+        matches!(
+            (self, lifecycle),
+            (
+                Self::CompletedTasks | Self::FailedTasks | Self::CancelledTasks,
+                EntityLifecycle::Task(_),
+            ) | (Self::ExitedRepls, EntityLifecycle::Repl(_))
+                | (Self::FailedServices, EntityLifecycle::Service(_))
+        )
+    }
+}
+
+/// Whether cleanup covers the whole session or one tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupTarget {
+    EntireSession,
+    SingleTab(TabId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupExecutionMode {
+    Execute,
+    DryRun,
+}
+
+/// Validated `workspace_cleanup` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupRequest {
+    /// At least one scope; duplicates keep their first position.
+    pub scopes: Vec<CleanupScope>,
+    pub target: CleanupTarget,
+    pub mode: CleanupExecutionMode,
+}
+
+impl CleanupRequest {
+    /// Rejects an empty scope list so a bare call can never mean "close everything".
+    pub fn parse(
+        scopes: Vec<CleanupScope>,
+        target: CleanupTarget,
+        mode: CleanupExecutionMode,
+    ) -> Result<Self, ParseError> {
+        if scopes.is_empty() {
+            return Err(ParseError::Empty { field: "scopes" });
+        }
+        let mut unique = Vec::with_capacity(scopes.len());
+        for scope in scopes {
+            if !unique.contains(&scope) {
+                unique.push(scope);
+            }
+        }
+        Ok(Self {
+            scopes: unique,
+            target,
+            mode,
+        })
+    }
+}
 
 /// In-memory record for a single managed Zellij terminal pane.
 #[derive(Debug, Clone)]
@@ -69,6 +359,15 @@ impl TransitionEffects {
         self.exited_panes.extend(other.exited_panes);
         self.closed_panes.extend(other.closed_panes);
         self.subscription_dirty |= other.subscription_dirty;
+    }
+
+    /// Effects for closing one pane, including the write-lock release keyed by `closed_panes`.
+    pub fn close_pane(pane_id: TerminalPaneId) -> Self {
+        Self {
+            visual_actions: vec![VisualAction::ClosePane { pane_id }],
+            closed_panes: vec![pane_id],
+            ..Self::default()
+        }
     }
 }
 
@@ -135,10 +434,11 @@ pub struct StateStore {
     early_closes: HashSet<TerminalPaneId>,
     pending_alerts: Vec<WorkspaceAlert>,
     next_task_seq: u64,
+    retention: RetentionPolicy,
 }
 
 impl StateStore {
-    pub fn new(session: SessionName) -> Self {
+    pub fn new(session: SessionName, retention: RetentionPolicy) -> Self {
         Self {
             layout: LayoutState::new(session),
             session_dead: false,
@@ -148,6 +448,7 @@ impl StateStore {
             early_closes: HashSet::new(),
             pending_alerts: Vec::new(),
             next_task_seq: 1,
+            retention,
         }
     }
 
@@ -271,14 +572,6 @@ impl StateStore {
                                 effects.changed_keys.push(key);
                                 effects.exited_panes.push(pane_id);
                                 effects.subscription_dirty = true;
-                                for gc_pane in self.select_and_mark_completed_tasks_for_gc(
-                                    MAX_RETAINED_COMPLETED_TASKS,
-                                ) {
-                                    effects
-                                        .visual_actions
-                                        .push(VisualAction::ClosePane { pane_id: gc_pane });
-                                    effects.closed_panes.push(gc_pane);
-                                }
                             }
                             other_nonzero => {
                                 let code = other_nonzero.unwrap_or(FALLBACK_NONZERO_EXIT);
@@ -468,6 +761,7 @@ impl StateStore {
                 effects.subscription_dirty = true;
             }
         }
+        effects.extend(self.enforce_retention(EvictionReason::RetentionGc));
         effects
     }
 
@@ -760,6 +1054,7 @@ impl StateStore {
         }
 
         self.prune_closed_history(MAX_RETAINED_CLOSED_RECORDS);
+        effects.extend(self.enforce_retention(EvictionReason::RetentionGc));
         effects
     }
 
@@ -830,61 +1125,164 @@ impl StateStore {
         }
     }
 
-    /// Selects oldest open `Completed` task panes exceeding `keep_recent` for GC; never selects
-    /// failed or already-closed panes.
-    pub fn select_completed_tasks_for_gc(&self, keep_recent: usize) -> Vec<TerminalPaneId> {
-        let mut completed: Vec<(SystemTime, TerminalPaneId)> = self
+    /// Selects finished panes above the configured quotas and marks them closed.
+    pub fn enforce_retention(&mut self, reason: EvictionReason) -> TransitionEffects {
+        let mut evicted = Vec::new();
+        for (class, quota) in [
+            (
+                RetentionClass::CompletedTasks,
+                self.retention.completed_tasks,
+            ),
+            (
+                RetentionClass::FailedAndCancelledTasks,
+                self.retention.failed_and_cancelled_tasks,
+            ),
+            (RetentionClass::ExitedRepls, self.retention.exited_repls),
+        ] {
+            evicted.extend(self.select_exceeding_quota(class, quota, reason));
+        }
+        self.mark_evicted(&evicted)
+    }
+
+    /// Selects the oldest finished panes of `class` beyond `quota`; the newest `ended_at` wins.
+    fn select_exceeding_quota(
+        &self,
+        class: RetentionClass,
+        quota: RetentionQuota,
+        reason: EvictionReason,
+    ) -> Vec<EvictablePane> {
+        let Some(keep) = quota.keep_count() else {
+            return Vec::new();
+        };
+        let mut candidates: Vec<(SystemTime, TerminalPaneId, &ManagedRecord)> = self
             .panes_by_key
             .values()
-            .filter_map(|rec| match &rec.lifecycle {
-                EntityLifecycle::Task(TaskLifecycle::Completed {
-                    ended_at,
-                    pane_closed: false,
-                    ..
-                }) => Some((*ended_at, rec.pane_id)),
-                EntityLifecycle::Task(
-                    TaskLifecycle::Completed {
-                        pane_closed: true, ..
-                    }
-                    | TaskLifecycle::Running { .. }
-                    | TaskLifecycle::Failed { .. }
-                    | TaskLifecycle::Cancelled { .. }
-                    | TaskLifecycle::StoppedByUser { .. },
-                )
-                | EntityLifecycle::Service(_)
-                | EntityLifecycle::Repl(_) => None,
+            .filter(|rec| class.matches(&rec.lifecycle))
+            .map(|rec| {
+                let ended_at = rec
+                    .lifecycle
+                    .ended_at()
+                    .unwrap_or_else(|| rec.lifecycle.started_at());
+                (ended_at, rec.pane_id, rec)
             })
             .collect();
-
-        // Sort newest first; evict everything beyond `keep_recent`.
-        completed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-        completed
+        // Keep the newest `keep` panes and evict the rest oldest first, so the human sees the
+        // oldest panes disappear first.
+        candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let evict_count = candidates.len().saturating_sub(keep);
+        candidates
             .into_iter()
-            .skip(keep_recent)
-            .map(|(_, pane_id)| pane_id)
+            .take(evict_count)
+            .map(|(_, _, rec)| evictable(rec, reason))
             .collect()
     }
 
-    fn select_and_mark_completed_tasks_for_gc(
-        &mut self,
-        keep_recent: usize,
-    ) -> Vec<TerminalPaneId> {
-        let to_close = self.select_completed_tasks_for_gc(keep_recent);
-        for pane_id in &to_close {
-            if let Some(key) = self.key_by_pane_id.get(pane_id).cloned()
-                && let Some(rec) = self.panes_by_key.get_mut(&key)
-                && let EntityLifecycle::Task(TaskLifecycle::Completed { pane_closed, .. }) =
-                    &mut rec.lifecycle
-            {
-                *pane_closed = true;
+    /// Marks panes closed and returns their close effects.
+    ///
+    /// A selection can be stale by the time it runs, so panes that became active or already
+    /// closed are skipped instead of closed.
+    pub fn mark_evicted(&mut self, panes: &[EvictablePane]) -> TransitionEffects {
+        let mut effects = TransitionEffects::default();
+        for pane in panes {
+            if self.key_by_pane_id.get(&pane.pane_id) != Some(&pane.key) {
+                continue;
             }
+            let Some(record) = self.panes_by_key.get_mut(&pane.key) else {
+                continue;
+            };
+            if record.lifecycle.is_active() || record.lifecycle.is_pane_closed() {
+                continue;
+            }
+            mark_lifecycle_pane_closed(&mut record.lifecycle);
+            effects.extend(TransitionEffects::close_pane(pane.pane_id));
         }
-        to_close
+        effects
+    }
+
+    /// Selects finished panes with an open pane that match the cleanup request.
+    pub fn select_panes_for_cleanup(&self, request: &CleanupRequest) -> Vec<EvictablePane> {
+        let mut selected: Vec<(SystemTime, EvictablePane)> = self
+            .panes_by_key
+            .values()
+            .filter(|rec| !rec.lifecycle.is_active() && !rec.lifecycle.is_pane_closed())
+            .filter(|rec| match request.target {
+                CleanupTarget::EntireSession => true,
+                CleanupTarget::SingleTab(tab_id) => rec.tab_id == tab_id,
+            })
+            .filter(|rec| {
+                request
+                    .scopes
+                    .iter()
+                    .any(|scope| scope.matches(&rec.lifecycle))
+            })
+            .map(|rec| {
+                let ended_at = rec
+                    .lifecycle
+                    .ended_at()
+                    .unwrap_or_else(|| rec.lifecycle.started_at());
+                (ended_at, evictable(rec, EvictionReason::ExplicitCleanup))
+            })
+            .collect();
+        selected.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.pane_id().cmp(&b.1.pane_id()))
+        });
+        selected.into_iter().map(|(_, pane)| pane).collect()
+    }
+
+    /// Counts active entities of the kinds the request addresses, which cleanup must never touch.
+    pub fn count_skipped_active(&self, request: &CleanupRequest) -> usize {
+        self.panes_by_key
+            .values()
+            .filter(|rec| {
+                rec.lifecycle.is_active()
+                    && request
+                        .scopes
+                        .iter()
+                        .any(|scope| scope.covers_kind(&rec.lifecycle))
+            })
+            .count()
+    }
+
+    /// Counts finished entities whose pane is still open, the `workspace_cleanup` backlog.
+    pub fn count_terminated_open_panes(&self) -> usize {
+        self.panes_by_key
+            .values()
+            .filter(|rec| !rec.lifecycle.is_active() && !rec.lifecycle.is_pane_closed())
+            .count()
+    }
+
+    /// Marks a freshly completed task for closing right after its logs were backfilled.
+    pub fn mark_fast_task_for_close(&mut self, key: &ManagedKey) -> Option<EvictablePane> {
+        let pane = {
+            let record = self.panes_by_key.get(key)?;
+            if !matches!(
+                record.lifecycle,
+                EntityLifecycle::Task(TaskLifecycle::Completed {
+                    pane_closed: false,
+                    ..
+                })
+            ) {
+                return None;
+            }
+            evictable(record, EvictionReason::FastPathAutoClose)
+        };
+        let _ = self.mark_evicted(std::slice::from_ref(&pane));
+        Some(pane)
     }
 
     /// Drains queued asynchronous alerts to attach to the next MCP tool response.
     pub fn drain_alerts(&mut self) -> Vec<WorkspaceAlert> {
         std::mem::take(&mut self.pending_alerts)
+    }
+}
+
+fn evictable(record: &ManagedRecord, reason: EvictionReason) -> EvictablePane {
+    EvictablePane {
+        key: record.key.clone(),
+        pane_id: record.pane_id,
+        tab_id: record.tab_id,
+        reason,
     }
 }
 

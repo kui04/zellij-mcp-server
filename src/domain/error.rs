@@ -41,6 +41,11 @@ pub enum ParseError {
         max_ms: u64,
         actual_ms: u64,
     },
+
+    #[error(
+        "invalid retention quota {raw:?}: expected \"0\", a positive integer, or \"unlimited\""
+    )]
+    InvalidRetentionQuota { raw: String },
 }
 
 /// Expected domain-level failures surfaced to MCP callers.
